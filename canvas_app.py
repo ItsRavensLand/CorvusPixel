@@ -6,18 +6,24 @@ draw:
 
 - **Keyboard**: arrow keys move the cursor; ``space`` paints with the current
   brush (idempotently — painting the same pixel twice never toggles it back);
-  ``x`` erases; ``e`` toggles the eraser tool; ``+``/``-`` grow/shrink the
+  ``x`` erases; ``e`` toggles the eraser tool; ``p`` returns to the paint tool;
+  ``r``/``o``/``f``/``s``/``l`` select the filled-rect / hollow-rect /
+  filled-square / hollow-square / line tools; ``+``/``-`` grow/shrink the
   square brush; ``[``/``]`` and ``{``/``}`` grow/shrink the canvas (columns at
   the right edge, rows at the bottom edge); ``c`` cycles the palette; ``1``-
   ``8`` pick a palette color; ``Tab`` opens the visual palette (arrow keys +
   Enter/space select); ``q`` or Ctrl+C quits.
 - **Mouse**: a clickable toolbar above the canvas — buttons for paint, eraser,
   brush size, palette, column/row resize and quit, plus a Paint-style brush-size
-  bar (click it, or drag the ``●`` handle, to size the brush). Clicking (or
-  click-dragging) on the canvas paints with the current brush; clicking a
-  palette swatch selects that color. A second row of common-colour swatches sits
-  at the bottom, ending in a rainbow "custom colour" swatch that opens a small
-  hex input (type ``#rrggbb`` digits, Enter to pick, Esc to cancel).
+  bar (click it, or drag the ``●`` handle, to size the brush). Five shape tools
+  (filled/hollow rectangle and square, plus a straight line) live at the
+  right-hand end of the top row: click one to select it, then click-drag on the
+  canvas — a dimmed preview follows the cursor and is committed on release
+  (Escape cancels). Clicking (or click-dragging) on the canvas paints with the
+  current brush; clicking a palette swatch selects that color. A second row of
+  common-colour swatches sits at the bottom, ending in a rainbow "custom
+  colour" swatch that opens a small hex input (type ``#rrggbb`` digits, Enter
+  to pick, Esc to cancel).
 - **Layout**: the canvas is centered in the terminal (horizontally and
   vertically) and re-centered when the terminal is resized (SIGWINCH). The
   cursor is a blinking reverse-video block framed by ``[ ]`` brackets so its
@@ -175,6 +181,136 @@ _TOOLBAR_SPEC: list[tuple[str, str, str, str]] = [
     ("quit", "[Quit]", "✕", "_tool_quit"),
 ]
 
+# --------------------------------------------------------------------------- #
+# Tools
+# --------------------------------------------------------------------------- #
+
+TOOL_PAINT = "paint"
+TOOL_ERASER = "eraser"
+TOOL_FILLED_RECT = "filled_rect"
+TOOL_FILLED_SQUARE = "filled_square"
+TOOL_HOLLOW_RECT = "hollow_rect"
+TOOL_HOLLOW_SQUARE = "hollow_square"
+TOOL_LINE = "line"
+
+SHAPE_TOOLS = (
+    TOOL_FILLED_RECT,
+    TOOL_FILLED_SQUARE,
+    TOOL_HOLLOW_RECT,
+    TOOL_HOLLOW_SQUARE,
+    TOOL_LINE,
+)
+
+_TOOL_LABELS: dict[str, str] = {
+    TOOL_PAINT: "paint",
+    TOOL_ERASER: "eraser",
+    TOOL_FILLED_RECT: "filled",
+    TOOL_FILLED_SQUARE: "filled-sq",
+    TOOL_HOLLOW_RECT: "hollow",
+    TOOL_HOLLOW_SQUARE: "hollow-sq",
+    TOOL_LINE: "line",
+}
+
+# The five shape tools, shown right-aligned on the top (header) row — a distinct
+# region from the centered toolbar. Same (ident, label, icon, action) convention
+# as ``_TOOLBAR_SPEC`` so rendering and hit-testing share one spec.
+_SHAPE_SPEC: list[tuple[str, str, str, str]] = [
+    ("filled_rect", "[FR]", "▬", "_tool_filled_rect"),
+    ("filled_square", "[FS]", "■", "_tool_filled_square"),
+    ("hollow_rect", "[HR]", "▭", "_tool_hollow_rect"),
+    ("hollow_square", "[HS]", "□", "_tool_hollow_square"),
+    ("line", "[Line]", "╱", "_tool_line"),
+]
+
+# In-progress shapes preview at 40% of the tool colour so they clearly read as
+# uncommitted ghosts.
+PREVIEW_DIM = 0.4
+
+
+# --------------------------------------------------------------------------- #
+# Shape geometry (pure functions, no app state — directly testable)
+# --------------------------------------------------------------------------- #
+
+
+def bresenham(x1: int, y1: int, x2: int, y2: int) -> list[tuple[int, int]]:
+    """Every pixel on the line (x1,y1)->(x2,y2), Bresenham, unbounded."""
+    out: list[tuple[int, int]] = []
+    dx = abs(x2 - x1)
+    dy = -abs(y2 - y1)
+    sx = 1 if x1 < x2 else -1
+    sy = 1 if y1 < y2 else -1
+    err = dx + dy
+    while True:
+        out.append((x1, y1))
+        if x1 == x2 and y1 == y2:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x1 += sx
+        if e2 <= dx:
+            err += dx
+            y1 += sy
+    return out
+
+
+def fill_rect_cells(
+    x1: int, y1: int, x2: int, y2: int
+) -> set[tuple[int, int]]:
+    """Every cell in the inclusive bounding box (x1,y1)-(x2,y2)."""
+    return {
+        (x, y)
+        for x in range(min(x1, x2), max(x1, x2) + 1)
+        for y in range(min(y1, y2), max(y1, y2) + 1)
+    }
+
+
+def hollow_rect_cells(
+    x1: int, y1: int, x2: int, y2: int, thickness: int
+) -> set[tuple[int, int]]:
+    """The border ring ``thickness`` cells thick around the inclusive box."""
+    xa, xb = min(x1, x2), max(x1, x2)
+    ya, yb = min(y1, y2), max(y1, y2)
+    t = max(1, thickness)
+    return {
+        (x, y)
+        for x in range(xa, xb + 1)
+        for y in range(ya, yb + 1)
+        if (x - xa) < t or (xb - x) < t or (y - ya) < t or (yb - y) < t
+    }
+
+
+def stamp_cells(cx: int, cy: int, size: int) -> set[tuple[int, int]]:
+    """The square brush centred on (cx, cy) — unbounded, like brush math."""
+    n = max(1, size)
+    half = n // 2
+    return {
+        (x, y)
+        for y in range(cy - half, cy - half + n)
+        for x in range(cx - half, cx - half + n)
+    }
+
+
+def thick_line_cells(
+    x1: int, y1: int, x2: int, y2: int, thickness: int
+) -> set[tuple[int, int]]:
+    """A line of the given thickness: the brush stamped along the centre line."""
+    cells: set[tuple[int, int]] = set()
+    for cx, cy in bresenham(x1, y1, x2, y2):
+        cells.update(stamp_cells(cx, cy, thickness))
+    return cells
+
+
+def square_end(
+    start: tuple[int, int], end: tuple[int, int]
+) -> tuple[int, int]:
+    """Snap ``end`` so the box from ``start`` is a square (start stays a corner)."""
+    (x1, y1), (x2, y2) = start, end
+    dx = 1 if x2 >= x1 else -1
+    dy = 1 if y2 >= y1 else -1
+    side = max(abs(x2 - x1), abs(y2 - y1))
+    return x1 + dx * side, y1 + dy * side
+
 
 def parse_hex(color: str) -> Color:
     """Parse a ``#rrggbb`` color string into an ``(r, g, b)`` tuple."""
@@ -229,9 +365,15 @@ class CanvasApp:
         self._palette_mode = False
         self._custom_color_mode = False
         self._hex_buffer = ""
-        self._eraser = False
+        self._tool = TOOL_PAINT
         self._brush_size = 1
         self._pending_resize: tuple[int, int] | None = None
+
+        # In-progress shape drag: start/end canvas cells and the local (never
+        # sent) preview overlay. Empty until a shape tool is dragged.
+        self._shape_drag: tuple[int, int] | None = None
+        self._shape_end: tuple[int, int] | None = None
+        self._preview_pixels: dict[tuple[int, int], Color] = {}
 
         self._sock: socket.socket | None = None
         self._quit = threading.Event()
@@ -375,7 +517,8 @@ class CanvasApp:
         """Current desired screen content: one cell per (2 vertical pixels).
 
         Only the rows that fit in the visible canvas area are returned; a
-        canvas taller than the window shows its top rows.
+        canvas taller than the window shows its top rows. An in-progress shape
+        drag overlays its preview pixels here (local only, never committed).
         """
         layout = self._layout()
         rows: list[list[Cell]] = []
@@ -383,8 +526,11 @@ class CanvasApp:
             row: list[Cell] = []
             has_bottom = y + 1 < self._height
             for x in range(self._width):
-                top = self._pixels[y][x]
-                bottom = self._pixels[y + 1][x] if has_bottom else self._background
+                top = self._preview_pixels.get((x, y), self._pixels[y][x])
+                if has_bottom:
+                    bottom = self._preview_pixels.get((x, y + 1), self._pixels[y + 1][x])
+                else:
+                    bottom = self._background
                 row.append((top, bottom))
             rows.append(row)
         return rows
@@ -405,8 +551,31 @@ class CanvasApp:
             if seg.text
         )
 
-    def _render_header(self) -> str:
-        tool = "eraser" if self._eraser else "paint"
+    def _shape_toolbar_geometry(
+        self, layout: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        """The five shape-tool buttons, right-aligned on the top (header) row."""
+        layout = layout or self._compute_layout()
+        total = -1  # every button is followed by a 1-column gap; drop the last
+        for _ident, label, icon, _action in _SHAPE_SPEC:
+            text = icon if self._icons else label
+            total += len(text) + 1
+        row = layout["top_pad"] + 1  # shares the header row
+        col = max(1, layout["term_w"] - total)
+        buttons: list[ToolButton] = []
+        for ident, label, icon, action in _SHAPE_SPEC:
+            text = icon if self._icons else label
+            buttons.append(ToolButton(ident, text, action, row, col))
+            col += len(text) + 1
+        return {"row": row, "width": total, "buttons": buttons}
+
+    def _render_top_line(self) -> str:
+        """Header status text + right-aligned shape-tool buttons on one row.
+
+        The header truncates early enough that the buttons never overlap it,
+        and the whole row is diffed as one unit in ``_draw_body``/``_redraw_chrome``.
+        """
+        tool = _TOOL_LABELS[self._tool]
         text = (
             f"CorvusPixel  {self._width}x{self._height}  "
             f"{'● connected' if self._connected else '○ reconnecting…'}   "
@@ -418,10 +587,22 @@ class CanvasApp:
         if self._custom_color_mode:
             fill = "·" * (6 - len(self._hex_buffer))
             text += f"   custom: #{self._hex_buffer}{fill}  (0-9a-f · enter ok · esc off)"
+        shape = self._shape_toolbar_geometry()
+        avail = max(8, self._layout()["term_w"] - shape["width"] - 2)
+        if len(text) > avail:
+            text = text[: max(0, avail - 1)] + "…"  # truncate, never wrap
+        parts = [self._styled(text, "bold #7fd4ff")]
         term_w = self._layout()["term_w"]
-        if len(text) > term_w:
-            text = text[: max(0, term_w - 1)] + "…"  # truncate, never wrap
-        return self._styled(text, "bold #7fd4ff")
+        for button in shape["buttons"]:
+            if button.col > term_w:
+                continue  # entirely off-screen: never wrap
+            label = button.label
+            if button.col + len(label) - 1 > term_w:
+                label = label[: max(0, term_w - button.col + 1)]
+            if button.ident == self._tool:
+                label = f"\x1b[7m{label}{RESET}"  # active tool shows reversed
+            parts.append(f"\x1b[{button.row};{button.col}H{label}")
+        return "".join(parts)
 
     def _quick_geometry(self, layout: dict[str, int] | None = None) -> dict[str, int]:
         """Row/columns of the always-visible bottom colour row (quick colours +
@@ -538,7 +719,7 @@ class CanvasApp:
             label = button.label
             if button.col + len(label) - 1 > term_w:
                 label = label[: max(0, term_w - button.col + 1)]
-            if button.ident == "eraser" and self._eraser:
+            if button.ident == self._tool:
                 label = f"\x1b[7m{label}{RESET}"  # active tool shows reversed
             parts.append(f"\x1b[{button.row};{button.col}H{label}")
         slider = geom["slider"]
@@ -585,7 +766,7 @@ class CanvasApp:
         layout = self._layout()
         rows = self._display_rows()
 
-        header = self._render_header()
+        header = self._render_top_line()
         if header != self._old_header:
             file.write(f"\x1b[{layout['top_pad'] + 1};1H\x1b[2K")
             file.write(header)
@@ -732,7 +913,7 @@ class CanvasApp:
             layout = self._layout()
             rows = self._display_rows()
 
-            header = self._render_header()
+            header = self._render_top_line()
             if header != self._old_header:
                 file.write(f"\x1b[{layout['top_pad'] + 1};1H\x1b[2K")
                 file.write(header)
@@ -828,7 +1009,7 @@ class CanvasApp:
 
     def _brush_color(self) -> Color:
         """What the brush paints right now: eraser paints the background."""
-        return self._background if self._eraser else self._color
+        return self._background if self._tool == TOOL_ERASER else self._color
 
     def _move_cursor(self, dx: int, dy: int) -> None:
         if self._width:
@@ -899,10 +1080,97 @@ class CanvasApp:
     def _tool_paint(self) -> list[dict[str, Any]]:
         return self._paint_at_cursor()
 
-    def _tool_eraser(self) -> list[dict[str, Any]]:
-        self._eraser = not self._eraser
+    def _set_tool(self, tool: str) -> list[dict[str, Any]]:
+        self._tool = tool
         self._pending_chrome = True
         return []
+
+    def _tool_eraser(self) -> list[dict[str, Any]]:
+        # 'e' toggles between eraser and paint (like before); picking a shape
+        # tool is a separate, one-way selection.
+        self._tool = TOOL_ERASER if self._tool != TOOL_ERASER else TOOL_PAINT
+        self._pending_chrome = True
+        return []
+
+    def _tool_filled_rect(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_FILLED_RECT)
+
+    def _tool_filled_square(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_FILLED_SQUARE)
+
+    def _tool_hollow_rect(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_HOLLOW_RECT)
+
+    def _tool_hollow_square(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_HOLLOW_SQUARE)
+
+    def _tool_line(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_LINE)
+
+    # -- shape drag state machine ---------------------------------------------
+
+    def _shape_cells(
+        self, start: tuple[int, int], end: tuple[int, int]
+    ) -> set[tuple[int, int]]:
+        """The unclipped cells the current shape tool draws from ``start`` to ``end``."""
+        x1, y1 = start
+        x2, y2 = end
+        if self._tool in (TOOL_FILLED_SQUARE, TOOL_HOLLOW_SQUARE):
+            x2, y2 = square_end(start, end)
+        if self._tool in (TOOL_FILLED_RECT, TOOL_FILLED_SQUARE):
+            return fill_rect_cells(x1, y1, x2, y2)
+        if self._tool in (TOOL_HOLLOW_RECT, TOOL_HOLLOW_SQUARE):
+            return hollow_rect_cells(x1, y1, x2, y2, self._brush_size)
+        return thick_line_cells(x1, y1, x2, y2, self._brush_size)
+
+    def _apply_shape_cells(self, cells: set[tuple[int, int]]) -> list[dict[str, Any]]:
+        """Commit shape cells to the local canvas, clipped; returns the changes."""
+        changes: list[dict[str, Any]] = []
+        for x, y in cells:
+            if 0 <= x < self._width and 0 <= y < self._height:
+                change = self._paint_pixel(x, y, self._color)
+                if change is not None:
+                    changes.append(change)
+        return changes
+
+    def _shape_motion(self, x: int, y: int) -> list[dict[str, Any]]:
+        """Press starts a shape drag; motion moves its end. Nothing is committed."""
+        if self._shape_drag is None:
+            self._shape_drag = (x, y)
+        self._shape_end = (x, y)
+        self._refresh_preview()
+        return []
+
+    def _refresh_preview(self) -> None:
+        """Recompute the dimmed local preview overlay for the current drag."""
+        if self._shape_drag is None or self._shape_end is None:
+            self._preview_pixels = {}
+            return
+        cells = self._shape_cells(self._shape_drag, self._shape_end)
+        dimmed = tuple(int(c * PREVIEW_DIM) for c in self._color)
+        self._preview_pixels = {cell: dimmed for cell in cells}
+
+    def _commit_shape(self) -> list[dict[str, Any]]:
+        """Commit the in-progress shape as a normal edit; clears the preview."""
+        if self._shape_drag is None:
+            return []
+        changes = self._apply_shape_cells(
+            self._shape_cells(self._shape_drag, self._shape_end)
+        )
+        self._shape_drag = None
+        self._shape_end = None
+        self._preview_pixels = {}
+        return changes
+
+    def _cancel_shape_drag(self) -> None:
+        """Escape during a drag: drop the preview, leave the canvas untouched."""
+        if self._shape_drag is None:
+            return
+        self._shape_drag = None
+        self._shape_end = None
+        self._preview_pixels = {}
+        self._pending_chrome = False  # force a full canvas redraw (not just chrome)
+        self._draw()
 
     def _tool_brush_dec(self) -> list[dict[str, Any]]:
         return self._set_brush_size(self._brush_size - 1)
@@ -960,18 +1228,32 @@ class CanvasApp:
     def _handle_mouse(
         self, button: int, col: int, row: int, pressed: bool
     ) -> list[dict[str, Any]]:
-        """SGR mouse event: toolbar button / brush bar, palette swatch, quick-
-        colour swatch, or paint.
+        """SGR mouse event: shape-tool button, toolbar button / brush bar,
+        palette swatch, quick-colour swatch, or paint — or a shape drag.
 
-        A click on the canvas fills both halves of the cell under the cursor
-        with the brush. Toolbar and swatch clicks act like the matching
-        keyboard shortcut (and leave palette mode, mirroring keyboard behaviour).
-        Any click also cancels an in-progress custom-colour hex input.
+        With Paint/Eraser active, a click (or click-drag) on the canvas fills
+        both halves of the cell under the cursor with the brush, exactly as
+        before. With a shape tool active, press starts a drag, motion moves the
+        preview's end point, and release commits the shape as a normal edit; a
+        release with no drag in progress is a no-op. Toolbar and swatch clicks
+        act like the matching keyboard shortcut (and leave palette mode,
+        mirroring keyboard behaviour). Any click also cancels an in-progress
+        custom-colour hex input.
         """
-        if not pressed or button not in (0, 32):
-            return []
+        if not pressed:
+            return self._commit_shape()  # release: commit any in-progress shape
         if self._custom_color_mode:
             self._exit_custom_color()
+        if button not in (0, 4, 32, 36):
+            return []  # middle/right button, or a stray event
+        shape = self._shape_toolbar_geometry()
+        if row == shape["row"]:
+            for b in shape["buttons"]:
+                if b.contains(col, row):
+                    if self._palette_mode:
+                        self._palette_mode = False
+                        self._pending_chrome = True
+                    return getattr(self, b.action)()
         geom = self._toolbar_geometry()
         if row == geom["row"]:
             slider = geom["slider"]
@@ -1008,6 +1290,8 @@ class CanvasApp:
             return []
         cell_col, display_row = hit
         top_y = display_row * 2
+        if self._tool in SHAPE_TOOLS:
+            return self._shape_motion(cell_col, top_y)
         color = self._brush_color()
         changes = self._paint(cell_col, top_y, color)
         bottom_y = top_y + 1
@@ -1076,9 +1360,21 @@ class CanvasApp:
         if ch == "x":
             return self._erase()
         if ch == "e":
-            self._eraser = not self._eraser
+            self._tool = TOOL_ERASER if self._tool != TOOL_ERASER else TOOL_PAINT
             self._pending_chrome = True
             return []
+        if ch == "p":
+            return self._set_tool(TOOL_PAINT)
+        if ch == "r":
+            return self._set_tool(TOOL_FILLED_RECT)
+        if ch == "o":
+            return self._set_tool(TOOL_HOLLOW_RECT)
+        if ch == "f":
+            return self._set_tool(TOOL_FILLED_SQUARE)
+        if ch == "s":
+            return self._set_tool(TOOL_HOLLOW_SQUARE)
+        if ch == "l":
+            return self._set_tool(TOOL_LINE)
         if ch in "+=":
             return self._set_brush_size(self._brush_size + 1)
         if ch in "-_":
@@ -1138,6 +1434,8 @@ class CanvasApp:
         if second != b"[":
             if self._custom_color_mode:
                 self._exit_custom_color()  # a stray Esc cancels the hex input
+            if self._shape_drag is not None:
+                self._cancel_shape_drag()  # a stray Esc cancels an in-progress shape
             return []  # Alt+key or a stray ESC: ignore
         buf = ""
         while True:

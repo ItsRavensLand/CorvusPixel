@@ -44,7 +44,11 @@ session it just says "Canvas already open in this session."
   brush bar (or drag its `●` handle) to size the brush; click a palette swatch
   or a swatch in the bottom colour row to pick a color (the rainbow swatch at
   the end opens a small hex input — type six hex digits, Enter to pick, Esc to
-  cancel); click (or click-drag) on the canvas to paint with the brush.
+  cancel); click (or click-drag) on the canvas to paint with the brush. Pick a
+  **shape tool** from the top-right corner of the window (filled/hollow
+  rectangle or square, or a straight line) and click-drag on the canvas to draw:
+  a dimmed preview follows the cursor, release commits the shape in the current
+  color, Escape cancels it.
 - **Keyboard**
   - arrow keys — move the cursor (a blinking reverse-video block framed by
     `[ ]` brackets, so it stays visible even on an empty canvas)
@@ -52,6 +56,10 @@ session it just says "Canvas already open in this session."
     (idempotent: painting the same pixel twice never toggles it back)
   - `x` — erase at the cursor
   - `e` — toggle the eraser tool (paints the background color)
+  - `r`/`o` — filled / hollow rectangle tool ·
+    `f`/`s` — filled / hollow square tool ·
+    `l` — straight-line tool (each draws on a click-drag; outline and line
+    thickness follow the brush size) · `p` — back to the paint tool
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
     the toolbar's brush bar does the same with the mouse)
   - `[`/`]` — shrink/grow the canvas width (right edge) ·

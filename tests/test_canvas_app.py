@@ -23,8 +23,20 @@ from canvas_app import (
     MIN_CANVAS,
     PALETTE,
     QUICK_COLORS,
+    TOOL_ERASER,
+    TOOL_FILLED_RECT,
+    TOOL_FILLED_SQUARE,
+    TOOL_HOLLOW_RECT,
+    TOOL_HOLLOW_SQUARE,
+    TOOL_LINE,
+    TOOL_PAINT,
     CanvasApp,
     ToolButton,
+    bresenham,
+    fill_rect_cells,
+    hollow_rect_cells,
+    square_end,
+    thick_line_cells,
 )
 
 FULL = {
@@ -277,11 +289,11 @@ def test_eraser_paints_background():
     app._pixels[2][1] = (255, 255, 255)
     app._cursor_x, app._cursor_y = 1, 2
     app._handle_char("e")
-    assert app._eraser is True
+    assert app._tool == TOOL_ERASER
     changes = app._handle_char(" ")
     assert changes == [{"x": 1, "y": 2, "color": [10, 10, 10]}]
     app._handle_char("e")
-    assert app._eraser is False
+    assert app._tool == TOOL_PAINT
 
 
 def test_eraser_with_mouse():
@@ -527,11 +539,11 @@ def test_toolbar_paint_button_paints_idempotently():
 
 def test_toolbar_eraser_button_toggles():
     app = make_app()
-    assert app._eraser is False
+    assert app._tool == TOOL_PAINT
     click_toolbar(app, "eraser")
-    assert app._eraser is True
+    assert app._tool == TOOL_ERASER
     click_toolbar(app, "eraser")
-    assert app._eraser is False
+    assert app._tool == TOOL_PAINT
 
 
 def test_toolbar_brush_buttons_step_and_clamp():
@@ -587,7 +599,7 @@ def test_toolbar_render_eraser_active_state():
     app = make_app()
     assert "[Eraser]" in app._render_toolbar()
     assert "\x1b[7m[Eraser]" not in app._render_toolbar()  # off = plain
-    app._eraser = True
+    app._tool = TOOL_ERASER
     assert "\x1b[7m[Eraser]" in app._render_toolbar()  # on = reversed
 
 
@@ -746,7 +758,7 @@ def test_toolbar_icons_render_when_enabled():
     assert "●" in rendered  # paint icon
     b = toolbar_button(app, "paint")
     assert b.width == 1  # icons are single-width, so geometry shrinks
-    app._eraser = True
+    app._tool = TOOL_ERASER
     assert "\x1b[7m▨" in app._render_toolbar()  # active tool still reverses
 
 
@@ -1106,3 +1118,175 @@ def test_pump_socket_returns_when_quit_is_set():
     app._pump_socket(FakeSocket([("timeout",), ("timeout",)]))
     assert app.applied == []
 
+
+
+# --------------------------------------------------------------------------- #
+# Shape tools: geometry, drag->preview->commit, cancel, thickness
+# --------------------------------------------------------------------------- #
+
+
+def test_bresenham_line_points():
+    assert bresenham(0, 0, 0, 3) == [(0, 0), (0, 1), (0, 2), (0, 3)]
+    assert bresenham(0, 0, 3, 0) == [(0, 0), (1, 0), (2, 0), (3, 0)]
+    diag = bresenham(0, 0, 3, 3)
+    assert len(diag) == 4 and set(diag) == {(i, i) for i in range(4)}
+    assert bresenham(3, 3, 0, 0) == [(3, 3), (2, 2), (1, 1), (0, 0)]  # reversed
+
+
+def test_fill_rect_cells():
+    assert fill_rect_cells(1, 1, 3, 3) == {(x, y) for x in (1, 2, 3) for y in (1, 2, 3)}
+    assert fill_rect_cells(3, 3, 1, 1) == fill_rect_cells(1, 1, 3, 3)  # order-free
+
+
+def test_hollow_rect_border_ring():
+    cells = hollow_rect_cells(0, 0, 2, 2, 1)
+    assert len(cells) == 8  # a 3x3 border ring
+    assert (1, 1) not in cells  # the centre stays hollow
+    assert hollow_rect_cells(0, 0, 2, 2, 3) == {(x, y) for x in range(3) for y in range(3)}
+
+
+def test_hollow_rect_thickness_2():
+    cells = hollow_rect_cells(0, 0, 4, 4, 2)
+    assert (2, 2) not in cells  # only the 1x1 centre is left hollow
+    assert len(cells) == 24  # 25 - 1
+
+
+def test_thick_line_stamps_brush():
+    assert set(thick_line_cells(0, 0, 4, 0, 1)) == {(x, 0) for x in range(5)}
+    thick = thick_line_cells(0, 0, 4, 0, 3)
+    assert all((x, y) in thick for x in range(5) for y in (-1, 0, 1))
+
+
+def test_square_end_snaps():
+    assert square_end((0, 0), (3, 1)) == (3, 3)
+    assert square_end((0, 0), (1, 3)) == (3, 3)
+    assert square_end((5, 5), (5, 5)) == (5, 5)
+    assert square_end((4, 4), (1, 2)) == (1, 1)  # negative drag direction
+
+
+def shape_press(app, x, dy):
+    col, row = cell_screen(app, x, dy)
+    return app._handle_csi(f"<0;{col};{row}", "M")
+
+
+def shape_drag(app, x, dy):
+    col, row = cell_screen(app, x, dy)
+    return app._handle_csi(f"<32;{col};{row}", "M")
+
+
+def shape_release(app, x, dy):
+    col, row = cell_screen(app, x, dy)
+    return app._handle_csi(f"<3;{col};{row}", "m")
+
+
+def test_filled_rect_drag_preview_then_commit():
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._tool = TOOL_FILLED_RECT
+    # press at display cell (1,0) -> canvas (1,0): nothing committed, preview on
+    assert shape_press(app, 1, 0) == []
+    assert app._preview_pixels  # preview is showing
+    assert app._pixels[0][1] == (10, 10, 10)  # canvas untouched during the drag
+    # drag to display cell (2,1) -> canvas (2,2): preview grows, still untouched
+    assert shape_drag(app, 2, 1) == []
+    assert app._shape_end == (2, 2)
+    assert app._pixels[2][2] == (10, 10, 10)
+    # release commits the 2x2 box at (1..2, 0..2) as a normal edit
+    changes = shape_release(app, 2, 1)
+    assert app._preview_pixels == {}
+    assert len(changes) == 6
+    assert app._pixels[0][1] == (255, 0, 0)
+    assert app._pixels[2][2] == (255, 0, 0)
+
+
+def test_shape_escape_cancels_preview():
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._tool = TOOL_FILLED_RECT
+    shape_press(app, 1, 0)
+    shape_drag(app, 2, 1)
+    assert app._preview_pixels
+    # a bare ESC (not a CSI) cancels the drag
+    app._input_stream.write("\x1bz")
+    app._input_stream.seek(0)
+    assert app._read_byte() == b"\x1b"
+    assert app._read_escape_sequence() == []
+    assert app._preview_pixels == {}
+    assert app._shape_drag is None
+    assert app._pixels[0][1] == (10, 10, 10)  # the canvas was never touched
+
+
+def test_hollow_rect_commit_leaves_interior_empty():
+    app = make_app()
+    app._color = (0, 255, 0)
+    app._tool = TOOL_HOLLOW_RECT
+    app._brush_size = 1
+    # draw from (0,0) to (3,2): a 4x3 box; the ring is 10 cells, centre is hollow
+    shape_press(app, 0, 0)
+    shape_drag(app, 3, 1)
+    changes = shape_release(app, 3, 1)
+    assert len(changes) == 10
+    assert app._pixels[0][0] == (0, 255, 0)  # border
+    assert app._pixels[1][1] == (10, 10, 10)  # interior untouched
+    assert app._pixels[1][2] == (10, 10, 10)
+
+
+def test_filled_square_snaps_to_square():
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._tool = TOOL_FILLED_SQUARE
+    # drag from (0,0) across 3 columns and 2 rows -> snapped to a 4x4 square
+    shape_press(app, 0, 0)
+    shape_drag(app, 3, 1)
+    assert app._shape_end == (3, 2)  # raw end point
+    changes = shape_release(app, 3, 1)
+    assert len(changes) == 16  # 4x4 square, not 4x3
+
+
+def test_shape_toolbar_right_aligned_and_selects():
+    app = make_app()
+    shape = app._shape_toolbar_geometry()
+    assert shape["row"] == app._layout_info["top_pad"] + 1  # the header row
+    assert [b.ident for b in shape["buttons"]] == [
+        "filled_rect", "filled_square", "hollow_rect", "hollow_square", "line",
+    ]
+    last = shape["buttons"][-1]
+    assert last.col + last.width - 1 <= 80  # right-aligned, fits the terminal
+    b = shape["buttons"][0]
+    assert app._handle_csi(f"<0;{b.col};{b.row}", "M") == []
+    assert app._tool == TOOL_FILLED_RECT
+
+
+def test_shape_keyboard_shortcuts_select_tools():
+    app = make_app()
+    assert app._handle_char("r") == [] and app._tool == TOOL_FILLED_RECT
+    assert app._handle_char("o") == [] and app._tool == TOOL_HOLLOW_RECT
+    assert app._handle_char("f") == [] and app._tool == TOOL_FILLED_SQUARE
+    assert app._handle_char("s") == [] and app._tool == TOOL_HOLLOW_SQUARE
+    assert app._handle_char("l") == [] and app._tool == TOOL_LINE
+    assert app._handle_char("p") == [] and app._tool == TOOL_PAINT
+
+
+def test_paint_and_eraser_unaffected_by_shape_tools():
+    app = make_app()
+    app._color = (255, 0, 0)
+    col, row = cell_screen(app, 2, 0)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == [
+        {"x": 2, "y": 0, "color": [255, 0, 0]},
+        {"x": 2, "y": 1, "color": [255, 0, 0]},
+    ]  # plain paint unchanged
+    app._handle_char("r")  # pick a shape tool...
+    app._handle_char("p")  # ...and come back to paint
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []  # already red: no-op, no toggle
+    app._handle_char("e")  # eraser still toggles
+    assert app._tool == TOOL_ERASER
+
+
+def test_top_line_has_header_and_shape_buttons():
+    app = make_app()
+    top = app._render_top_line()
+    assert "CorvusPixel" in top
+    assert "[FR]" in top and "[Line]" in top  # shape buttons in text mode
+    app._icons = True
+    top = app._render_top_line()
+    assert "■" in top and "╱" in top  # shape icons when the terminal supports them
