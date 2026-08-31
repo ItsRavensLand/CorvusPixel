@@ -10,6 +10,8 @@ Run with:  .venv/bin/python -m pytest
 """
 
 import io
+import re
+import socket
 
 from rich.console import Console
 
@@ -900,3 +902,207 @@ def test_click_outside_bottom_row_is_ignored():
     # one row below the quick-colour row: nothing there to click
     assert app._handle_csi(f"<0;{g['indent'] + 2};{g['row'] + 1}", "M") == []
     assert app._pixels[0][0] == (10, 10, 10)
+
+
+# --------------------------------------------------------------------------- #
+# Regression tests: over-large canvases and the socket read loop
+# --------------------------------------------------------------------------- #
+#
+# These pin the fixes for the last UI regression round:
+#   * a canvas bigger than the window is clamped + clipped, never wrapped or
+#     scrolled (the "split background", "invisible toolbar" and horizontal
+#     scrolling regressions);
+#   * swatch clicks always select, never paint, even when the layout overflows
+#     (the "swatch click paints the swatch" regression);
+#   * the socket read loop survives idle timeouts and split messages (the
+#     connection-flicker regression).
+
+
+BIG = {
+    "type": "full",
+    "width": 100,
+    "height": 100,
+    "background": [10, 10, 10],
+    "pixels": [[[10, 10, 10]] * 100 for _ in range(100)],
+}
+
+
+def make_big_app(size=SIZE) -> CanvasApp:
+    """A 100x100 canvas in a small terminal — the overflow scenario."""
+    out = io.StringIO()
+    console = Console(
+        file=out, force_terminal=True, color_system="truecolor",
+        width=size[0], height=size[1], force_interactive=True, legacy_windows=False,
+    )
+    app = CanvasApp(
+        "/tmp/nonexistent.sock", background=(10, 10, 10),
+        console=console, input_stream=io.StringIO(), size_provider=lambda: size,
+    )
+    app._blink_active = True
+    app._apply(BIG)
+    return app
+
+
+def test_layout_clamps_big_canvas_so_chrome_fits():
+    for size in [(60, 20), (169, 45), (40, 12)]:
+        app = make_big_app(size=size)
+        l = app._compute_layout()
+        assert l["canvas_rows"] == min(50, size[1] - 5)
+        assert l["content_h"] == 5 + l["canvas_rows"]
+        assert l["content_h"] <= size[1]  # chrome included, everything fits
+        assert l["top_pad"] + 5 + l["canvas_rows"] <= size[1]  # last chrome row
+        assert l["left_pad"] == max(0, (size[0] - 100 * CELL_W) // 2)
+
+
+def test_display_rows_shows_only_visible_top_rows():
+    app = make_big_app(size=(60, 20))
+    rows = app._display_rows()
+    assert len(rows) == app._compute_layout()["canvas_rows"] == 15
+    assert all(len(row) == 100 for row in rows)  # width never truncates
+
+
+def test_write_cell_clips_off_screen_cells():
+    app = make_big_app(size=(40, 10))
+    l = app._compute_layout()
+    assert l["left_pad"] == 0  # the 100-col canvas overflows the 40-col window
+    file = app._console.file
+    before = len(file.getvalue())
+    app._write_cell(file, 0, 30, ((255, 0, 0), (0, 0, 0)))  # right edge > term_w
+    assert len(file.getvalue()) == before  # clipped: nothing written
+    app._write_cell(file, 0, 0, ((255, 0, 0), (0, 0, 0)))  # fits
+    assert len(file.getvalue()) > before
+
+
+def test_screen_cell_rejects_clipped_columns_and_rows():
+    app = make_big_app(size=(40, 10))
+    l = app._compute_layout()
+    row0 = l["top_pad"] + 3
+    assert app._screen_cell(1 + l["left_pad"] + 19 * CELL_W, row0) == (19, 0)
+    assert app._screen_cell(1 + l["left_pad"] + 20 * CELL_W, row0) is None
+    # rows below the visible canvas are never canvas cells
+    assert app._screen_cell(1 + l["left_pad"] + 1, row0 + l["canvas_rows"]) is None
+
+
+def test_big_canvas_redraw_never_writes_past_term_width():
+    app = make_big_app(size=(60, 20))
+    out = app._console.file.getvalue()
+    max_col = 0
+    for m in re.finditer(r"\x1b\[(\d+);(\d+)H", out):
+        max_col = max(max_col, int(m.group(2)))
+    assert max_col <= 60  # no wrap: every cursor move stays on the screen
+
+
+def test_overflowed_palette_swatch_click_selects_never_paints():
+    app = make_big_app(size=(60, 20))
+    for idx in range(len(PALETTE)):
+        col, row = palette_swatch_screen(app, idx)
+        app._handle_csi(f"<0;{col};{row}", "M")
+        assert app._color == PALETTE[idx][1]
+        assert app._palette_idx == idx
+    for y in range(app._height):
+        assert all(p == (10, 10, 10) for p in app._pixels[y])  # never painted
+
+
+def test_overflowed_quick_swatch_click_selects_never_paints():
+    app = make_big_app(size=(60, 20))
+    for idx in range(len(QUICK_COLORS)):
+        col, row = quick_swatch_screen(app, idx)
+        app._handle_csi(f"<0;{col};{row}", "M")
+        assert app._color == QUICK_COLORS[idx][1]
+        assert app._quick_idx == idx
+    for y in range(app._height):
+        assert all(p == (10, 10, 10) for p in app._pixels[y])
+
+
+def test_overflowed_canvas_click_still_paints():
+    app = make_big_app(size=(60, 20))
+    col, row = cell_screen(app, 0, 0)  # top-left cell: always on-screen
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._pixels[0][0] == PALETTE[0][1]  # painted, not swallowed
+
+
+def test_overflowed_swatch_row_gap_click_is_ignored():
+    app = make_big_app(size=(60, 20))
+    g = app._quick_geometry()
+    # the padding column left of the first swatch on the quick-colour row
+    app._handle_csi(f"<0;{max(1, g['indent'])};{g['row']}", "M")
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+class FakeSocket:
+    """A minimal socket stub that replays queued recv() events."""
+
+    def __init__(self, events):
+        self._events = list(events)
+        self.timeout = 0.2
+
+    def recv(self, _n):
+        if not self._events:
+            return b""
+        kind = self._events.pop(0)
+        if kind == ("timeout",):
+            raise socket.timeout("timed out")
+        if kind == ("eof",):
+            return b""
+        return kind[1]
+
+    def close(self):
+        pass
+
+
+class PumpSpy(CanvasApp):
+    """A CanvasApp that counts socket traffic without drawing anything."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.applied = []
+        self.pumps = 0
+
+    def _draw(self):
+        pass
+
+    def _pump(self):
+        self.pumps += 1
+
+    def _apply(self, message):
+        self.applied.append(message)
+        super()._apply(message)
+
+
+FULL2 = (
+    b'{"type":"full","width":2,"height":2,"background":[0,0,0],'
+    b'"pixels":[[[0,0,0],[0,0,0]],[[0,0,0],[0,0,0]]]}\n'
+)
+
+
+def test_pump_socket_survives_timeouts_and_split_messages():
+    app = PumpSpy("/tmp/nonexistent.sock", size_provider=lambda: (80, 40))
+    update = b'{"type":"update","changes":[{"x":1,"y":0,"color":[255,0,0]}]}\n'
+    sock = FakeSocket([
+        ("data", FULL2),
+        ("timeout",),          # idle stretches must not kill the connection
+        ("timeout",),
+        ("data", update[:22]),  # a message split across two recv calls...
+        ("timeout",),           # ...with an idle timeout in the middle of it
+        ("data", update[22:]),
+        ("eof",),
+    ])
+    app._pump_socket(sock)
+    assert [m["type"] for m in app.applied] == ["full", "update"]
+    assert app._pixels[0][1] == (255, 0, 0)
+    assert app.pumps >= 3  # one per idle timeout + one after the update
+
+
+def test_pump_socket_ignores_garbage_lines():
+    app = PumpSpy("/tmp/nonexistent.sock", size_provider=lambda: (80, 40))
+    sock = FakeSocket([("data", b"not json\n"), ("eof",)])
+    app._pump_socket(sock)
+    assert app.applied == []
+
+
+def test_pump_socket_returns_when_quit_is_set():
+    app = PumpSpy("/tmp/nonexistent.sock", size_provider=lambda: (80, 40))
+    app._quit.set()
+    app._pump_socket(FakeSocket([("timeout",), ("timeout",)]))
+    assert app.applied == []
+

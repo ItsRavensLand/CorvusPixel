@@ -285,11 +285,19 @@ class CanvasApp:
         return True
 
     def _compute_layout(self) -> dict[str, int]:
-        """Where everything sits: centering offsets for the current terminal."""
+        """Where everything sits: centering offsets for the current terminal.
+
+        The canvas is clamped to the space that fits: ``chrome_rows`` rows are
+        always reserved for the header, toolbar, palette indicator + swatches,
+        and the quick-colour row, so the whole stack never overflows the window.
+        A canvas larger than the window shows its top rows (the bottom scrolls
+        out) and clips horizontally — it never wraps or scrolls the terminal.
+        """
         tw, th = self._query_size()
-        canvas_rows = max(1, (self._height + 1) // 2)  # ceil(height / 2)
-        # header + toolbar + canvas + palette (indicator + swatches) + quick colors
-        content_h = 1 + 1 + canvas_rows + 2 + 1
+        chrome_rows = 5  # header + toolbar + palette indicator + palette + quick
+        wanted = (self._height + 1) // 2  # ceil(height / 2)
+        canvas_rows = max(1, min(wanted, th - chrome_rows))
+        content_h = chrome_rows + canvas_rows
         top_pad = max(0, (th - content_h) // 2)
         left_pad = max(0, (tw - max(1, self._width) * CELL_W) // 2)
         return {
@@ -364,9 +372,14 @@ class CanvasApp:
     # -- drawing ---------------------------------------------------------------
 
     def _display_rows(self) -> list[list[Cell]]:
-        """Current desired screen content: one cell per (2 vertical pixels)."""
+        """Current desired screen content: one cell per (2 vertical pixels).
+
+        Only the rows that fit in the visible canvas area are returned; a
+        canvas taller than the window shows its top rows.
+        """
+        layout = self._layout()
         rows: list[list[Cell]] = []
-        for y in range(0, self._height, 2):
+        for y in range(0, min(self._height, layout["canvas_rows"] * 2), 2):
             row: list[Cell] = []
             has_bottom = y + 1 < self._height
             for x in range(self._width):
@@ -405,6 +418,9 @@ class CanvasApp:
         if self._custom_color_mode:
             fill = "·" * (6 - len(self._hex_buffer))
             text += f"   custom: #{self._hex_buffer}{fill}  (0-9a-f · enter ok · esc off)"
+        term_w = self._layout()["term_w"]
+        if len(text) > term_w:
+            text = text[: max(0, term_w - 1)] + "…"  # truncate, never wrap
         return self._styled(text, "bold #7fd4ff")
 
     def _quick_geometry(self, layout: dict[str, int] | None = None) -> dict[str, int]:
@@ -508,20 +524,37 @@ class CanvasApp:
         return {"row": row, "indent": indent, "buttons": buttons, "slider": slider}
 
     def _render_toolbar(self) -> str:
-        """ANSI string for the toolbar row (buttons + the brush-size bar)."""
+        """ANSI string for the toolbar row (buttons + the brush-size bar).
+
+        Buttons are clipped to the terminal width, so a narrow window clips
+        the far-right buttons instead of wrapping them onto the canvas row.
+        """
         geom = self._toolbar_geometry()
+        term_w = self._layout()["term_w"]
         parts: list[str] = []
         for button in geom["buttons"]:
+            if button.col > term_w:
+                continue  # entirely off-screen: never wrap
             label = button.label
+            if button.col + len(label) - 1 > term_w:
+                label = label[: max(0, term_w - button.col + 1)]
             if button.ident == "eraser" and self._eraser:
                 label = f"\x1b[7m{label}{RESET}"  # active tool shows reversed
             parts.append(f"\x1b[{button.row};{button.col}H{label}")
         slider = geom["slider"]
         if slider is not None:
             handle = f"\x1b[7m●{RESET}"
-            track = "─" * (self._brush_size - 1) + handle
-            track += "─" * (BRUSH_MAX - self._brush_size)
-            parts.append(f"\x1b[{slider.row};{slider.col}H{track}")
+            dashes_before = "─" * (self._brush_size - 1)
+            dashes_after = "─" * (BRUSH_MAX - self._brush_size)
+            avail = term_w - slider.col + 1
+            if avail >= BRUSH_MAX:  # everything fits: normal render
+                track = dashes_before + handle + dashes_after
+            elif avail > len(dashes_before):  # the handle fits, the tail clips
+                track = dashes_before + handle
+            else:
+                track = dashes_before[:avail]  # only leading dashes
+            if track:
+                parts.append(f"\x1b[{slider.row};{slider.col}H{track}")
         return "".join(parts)
 
     def _draw(self) -> None:
@@ -574,7 +607,9 @@ class CanvasApp:
                 continue
             if new_row is None:
                 # A row disappeared (canvas shrank): erase it.
-                file.write(f"\x1b[{layout['top_pad'] + 3 + y};1H\x1b[2K")
+                row = layout["top_pad"] + 3 + y
+                if row <= layout["term_h"]:
+                    file.write(f"\x1b[{row};1H\x1b[2K")
                 continue
             if old_row is None or len(new_row) != len(old_row):
                 # A brand-new or resized row: erase it and write every cell.
@@ -620,7 +655,8 @@ class CanvasApp:
             self._render_quick_colors(layout, qgeom)
 
         # Park the terminal cursor below everything so it never wanders.
-        file.write(f"\x1b[{layout['top_pad'] + 6 + layout['canvas_rows']};1H")
+        park = min(layout["term_h"], layout["top_pad"] + 6 + layout["canvas_rows"])
+        file.write(f"\x1b[{park};1H")
         file.flush()
 
     def _render_cursor(self, rows: list[list[Cell]]) -> None:
@@ -739,7 +775,8 @@ class CanvasApp:
                 self._render_quick_colors(layout, qgeom)
 
             # Park the terminal cursor below everything so it never wanders.
-            file.write(f"\x1b[{layout['top_pad'] + 6 + layout['canvas_rows']};1H")
+            park = min(layout["term_h"], layout["top_pad"] + 6 + layout["canvas_rows"])
+            file.write(f"\x1b[{park};1H")
             file.flush()
 
     def _write_cell(self, file: Any, y: int, x: int, cell: Cell, reverse: bool = False) -> None:
@@ -747,6 +784,8 @@ class CanvasApp:
         layout = self._layout()
         row = layout["top_pad"] + 3 + y  # row 1 header, row 2 toolbar
         col = layout["left_pad"] + x * CELL_W + 1
+        if row > layout["term_h"] or col + CELL_W - 1 > layout["term_w"]:
+            return  # off-screen: clip instead of wrapping / scrolling
         (fr, fg, fb), (br, bg, bb) = cell
         file.write(f"\x1b[{row};{col}H")
         file.write(f"\x1b[38;2;{fr};{fg};{fb}m")
@@ -904,6 +943,8 @@ class CanvasApp:
         x = (col - 1 - layout["left_pad"]) // CELL_W
         if x < 0 or x >= self._width:
             return None
+        if layout["left_pad"] + (x + 1) * CELL_W > layout["term_w"]:
+            return None  # this cell is clipped (its right edge is off-screen)
         return x, dy
 
     def _palette_hit(self, col: int, row: int) -> int | None:
@@ -1212,6 +1253,44 @@ class CanvasApp:
             self._connected = connected
             self._draw()
 
+    def _pump_socket(self, sock: socket.socket) -> None:
+        """Read server messages from ``sock`` until it closes or we quit.
+
+        Uses ``recv`` directly rather than ``makefile().readline()``: a file
+        object made from a socket whose timeout has fired is poisoned — after
+        the first timeout every read raises ``OSError('cannot read from timed
+        out object')`` (a plain OSError, not ``socket.timeout``), which the old
+        loop read as a disconnect and reconnected every 0.2s — the status bar
+        flickering between "connected" and "reconnecting…". ``recv`` raises
+        ``socket.timeout`` cleanly on every timeout, so idle time just pumps
+        the blink and re-centring.
+        """
+        buffer = b""
+        while not self._quit.is_set():
+            try:
+                chunk = sock.recv(65536)
+            except InterruptedError:
+                continue  # a signal (e.g. SIGWINCH) interrupted the read
+            except socket.timeout:
+                self._pump()  # idle: blink + re-centre
+                continue
+            except OSError:
+                return
+            if not chunk:
+                return  # the server closed the socket
+            buffer += chunk
+            while b"\n" in buffer:
+                raw, _, buffer = buffer.partition(b"\n")
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                self._apply(message)
+                self._pump()
+
     def run(self) -> None:
         """Connect (retrying forever), draw the canvas, and pump user input."""
         raw = self._enter_raw_mode()
@@ -1242,36 +1321,11 @@ class CanvasApp:
                     self._set_connected(True)
                     try:
                         sock.settimeout(0.2)
-                        stream = sock.makefile("r", encoding="utf-8")
-                        while not self._quit.is_set():
-                            try:
-                                line = stream.readline()
-                            except InterruptedError:
-                                continue  # a signal (e.g. SIGWINCH) interrupted the read
-                            except socket.timeout:
-                                self._pump()  # idle: blink + re-centre
-                                continue
-                            except OSError:
-                                break
-                            if not line:
-                                break
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                message = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            self._apply(message)
-                            self._pump()
+                        self._pump_socket(sock)
                     except OSError:
                         pass
                     finally:
                         self._sock = None
-                        try:
-                            stream.close()
-                        except (OSError, UnboundLocalError):
-                            pass
                         try:
                             sock.close()
                         except OSError:
