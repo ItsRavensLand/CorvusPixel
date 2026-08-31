@@ -4,21 +4,25 @@ This replaces the old passive renderer. It connects to the MCP server's
 session-scoped Unix socket, renders the shared canvas live, and lets the user
 draw:
 
-- **Keyboard**: arrow keys move the cursor; ``space`` paints (or toggles) with
-  the current brush; ``x`` erases; ``e`` toggles the eraser tool; ``+``/``-``
-  grow/shrink the square brush; ``[``/``]`` and ``{``/``}`` grow/shrink the
-  canvas (columns at the right edge, rows at the bottom edge); ``c`` cycles the
-  palette; ``1``-``8`` pick a palette color; ``Tab`` opens the visual palette
-  (arrow keys + Enter/space select); ``q`` or Ctrl+C quits.
+- **Keyboard**: arrow keys move the cursor; ``space`` paints with the current
+  brush (idempotently — painting the same pixel twice never toggles it back);
+  ``x`` erases; ``e`` toggles the eraser tool; ``+``/``-`` grow/shrink the
+  square brush; ``[``/``]`` and ``{``/``}`` grow/shrink the canvas (columns at
+  the right edge, rows at the bottom edge); ``c`` cycles the palette; ``1``-
+  ``8`` pick a palette color; ``Tab`` opens the visual palette (arrow keys +
+  Enter/space select); ``q`` or Ctrl+C quits.
 - **Mouse**: a clickable toolbar above the canvas — buttons for paint, eraser,
   brush size, palette, column/row resize and quit, plus a Paint-style brush-size
   bar (click it, or drag the ``●`` handle, to size the brush). Clicking (or
   click-dragging) on the canvas paints with the current brush; clicking a
-  palette swatch selects that color.
+  palette swatch selects that color. A second row of common-colour swatches sits
+  at the bottom, ending in a rainbow "custom colour" swatch that opens a small
+  hex input (type ``#rrggbb`` digits, Enter to pick, Esc to cancel).
 - **Layout**: the canvas is centered in the terminal (horizontally and
   vertically) and re-centered when the terminal is resized (SIGWINCH). The
-  cursor is a blinking reverse-video block that always sits at the current
-  pixel, wherever it is.
+  cursor is a blinking reverse-video block framed by ``[ ]`` brackets so its
+  position is unambiguous even on an empty canvas (where reverse video would be
+  invisible because fg == bg).
 
 Rendering: each logical pixel is drawn as ``CELL_W`` (2) terminal columns of a
 half-block ``▀``, so one display cell spans two canvas rows *and* two terminal
@@ -97,6 +101,20 @@ PALETTE: list[tuple[str, Color]] = [
     ("pink", (255, 120, 150)),
 ]
 
+# A second row of everyday colours always visible at the bottom of the window
+# (clickable, like the palette swatches) plus a rainbow "custom colour" swatch
+# that opens a hex input. Keeping both rows separate from the 8-key palette.
+QUICK_COLORS: list[tuple[str, Color]] = [
+    ("orange", (255, 140, 0)),
+    ("purple", (128, 0, 128)),
+    ("teal", (0, 128, 128)),
+    ("brown", (139, 69, 19)),
+    ("gray", (128, 128, 128)),
+    ("maroon", (128, 0, 0)),
+    ("olive", (128, 128, 0)),
+    ("navy", (0, 0, 128)),
+]
+
 
 class ToolButton:
     """A clickable toolbar button: a labelled region with an on-click action."""
@@ -141,18 +159,20 @@ class BrushSlider:
 # The toolbar is a single row of clickable buttons declared in one place, so the
 # renderer and the mouse hit-testing both come from the same spec. ``action`` is
 # the name of a CanvasApp method to invoke on click; the slider is special.
-_TOOLBAR_SPEC: list[tuple[str, str, str]] = [
-    ("paint", "[Paint]", "_tool_paint"),
-    ("eraser", "[Eraser]", "_tool_eraser"),
-    ("brush_dec", "[-]", "_tool_brush_dec"),
-    ("brush_slider", "", "brush_slider"),
-    ("brush_inc", "[+]", "_tool_brush_inc"),
-    ("palette", "[Palette]", "_tool_palette"),
-    ("col_dec", "[W-]", "_tool_col_dec"),
-    ("col_inc", "[W+]", "_tool_col_inc"),
-    ("row_dec", "[H-]", "_tool_row_dec"),
-    ("row_inc", "[H+]", "_tool_row_inc"),
-    ("quit", "[Quit]", "_tool_quit"),
+# Each entry carries both a text label and a single-width Unicode icon; which
+# one renders depends on the terminal's Unicode support (``_use_icons``).
+_TOOLBAR_SPEC: list[tuple[str, str, str, str]] = [
+    ("paint", "[Paint]", "●", "_tool_paint"),
+    ("eraser", "[Eraser]", "▨", "_tool_eraser"),
+    ("brush_dec", "[-]", "−", "_tool_brush_dec"),
+    ("brush_slider", "", "", "brush_slider"),
+    ("brush_inc", "[+]", "+", "_tool_brush_inc"),
+    ("palette", "[Palette]", "◉", "_tool_palette"),
+    ("col_dec", "[W-]", "◀", "_tool_col_dec"),
+    ("col_inc", "[W+]", "▶", "_tool_col_inc"),
+    ("row_dec", "[H-]", "▲", "_tool_row_dec"),
+    ("row_inc", "[H+]", "▼", "_tool_row_inc"),
+    ("quit", "[Quit]", "✕", "_tool_quit"),
 ]
 
 
@@ -203,8 +223,12 @@ class CanvasApp:
         self._cursor_x = 0
         self._cursor_y = 0
         self._palette_idx = 0
+        self._palette_active = True  # whether the palette (not quick row) is the source
+        self._quick_idx: int | None = None
         self._color = PALETTE[0][1]
         self._palette_mode = False
+        self._custom_color_mode = False
+        self._hex_buffer = ""
         self._eraser = False
         self._brush_size = 1
         self._pending_resize: tuple[int, int] | None = None
@@ -217,15 +241,16 @@ class CanvasApp:
         self._size_provider = size_provider
 
         self._console = console or Console(color_system="truecolor")
+        self._icons = self._use_icons()
         # What is currently drawn on screen (all coordinates absolute, centered).
         self._layout_info: dict[str, int] | None = None
         self._force_full = True
         self._old_cells: list[list[Cell]] = []
         self._old_header = ""
-        self._old_status = ""
         self._old_toolbar = ""
         self._pending_chrome = False  # next input only touches the chrome, not canvas
         self._old_palette_key: tuple[Any, ...] | None = None
+        self._old_quick_key: tuple[Any, ...] | None = None
         self._old_cursor_cell: tuple[int, int] | None = None
         self._cursor_was_reversed = False
         self._blink_active = self._blink_on()
@@ -239,11 +264,31 @@ class CanvasApp:
         size = shutil.get_terminal_size()
         return size.columns, size.lines
 
+    def _use_icons(self) -> bool:
+        """Whether the toolbar should render Unicode icons instead of text labels.
+
+        We don't probe the terminal's font (there is no reliable way to); we use
+        the usual heuristics: an explicit ``CORVUSPIXEL_ICONS=0/1`` override wins,
+        otherwise we need a UTF-8 output encoding and a terminal that usually has
+        the glyphs (not the Linux console or a dumb terminal). Tests pass a
+        StringIO console with no encoding, so they fall back to text labels.
+        """
+        override = os.environ.get("CORVUSPIXEL_ICONS")
+        if override is not None:
+            return override.strip().lower() not in ("", "0", "false", "no", "off")
+        encoding = (getattr(self._console.file, "encoding", None) or "").lower()
+        if "utf" not in encoding:
+            return False
+        term = os.environ.get("TERM", "")
+        if term in ("dumb", "linux") or term.startswith("cons"):
+            return False
+        return True
+
     def _compute_layout(self) -> dict[str, int]:
         """Where everything sits: centering offsets for the current terminal."""
         tw, th = self._query_size()
         canvas_rows = max(1, (self._height + 1) // 2)  # ceil(height / 2)
-        # header + toolbar + canvas + palette (indicator + swatches) + status
+        # header + toolbar + canvas + palette (indicator + swatches) + quick colors
         content_h = 1 + 1 + canvas_rows + 2 + 1
         top_pad = max(0, (th - content_h) // 2)
         left_pad = max(0, (tw - max(1, self._width) * CELL_W) // 2)
@@ -357,14 +402,49 @@ class CanvasApp:
         )
         if self._palette_mode:
             text += "   palette: arrows move · enter select"
+        if self._custom_color_mode:
+            fill = "·" * (6 - len(self._hex_buffer))
+            text += f"   custom: #{self._hex_buffer}{fill}  (0-9a-f · enter ok · esc off)"
         return self._styled(text, "bold #7fd4ff")
 
-    def _render_status(self) -> str:
-        return (
-            "mouse: toolbar · brush bar · swatches · canvas — "
-            "keys: arrows move · space paint/toggle · x erase · e eraser · "
-            "+/- brush · [ ] cols · { } rows · tab palette · q quit"
-        )
+    def _quick_geometry(self, layout: dict[str, int] | None = None) -> dict[str, int]:
+        """Row/columns of the always-visible bottom colour row (quick colours +
+        one custom-colour swatch). Centered like the palette."""
+        layout = layout or self._compute_layout()
+        swatch_w = CELL_W * 2
+        gap = 2
+        total = (len(QUICK_COLORS) + 1) * (swatch_w + gap) - gap  # + 1 = custom
+        indent = max(0, (layout["term_w"] - total) // 2)
+        return {
+            "indent": indent,
+            "swatch_w": swatch_w,
+            "gap": gap,
+            "row": layout["top_pad"] + 5 + layout["canvas_rows"],
+        }
+
+    def _render_quick_colors(self, layout: dict[str, int], geom: dict[str, int]) -> None:
+        """Draw the quick-colour swatch row; the custom swatch is a rainbow block."""
+        file = self._console.file
+        file.write(f"\x1b[{geom['row']};1H\x1b[2K")
+        for i, (_name, color) in enumerate(QUICK_COLORS):
+            left = geom["indent"] + i * (geom["swatch_w"] + geom["gap"])
+            file.write(f"\x1b[{geom['row']};{left + 1}H")
+            file.write(f"\x1b[38;2;{color[0]};{color[1]};{color[2]}m")
+            file.write(f"\x1b[48;2;{color[0]};{color[1]};{color[2]}m")
+            if i == self._quick_idx:
+                file.write("\x1b[7m")  # selected quick colour shows reversed
+            file.write(CELL_CH * (geom["swatch_w"] // CELL_W))
+            file.write(RESET)
+        # The custom-colour swatch: a 4-column rainbow signalling "more colours".
+        i = len(QUICK_COLORS)
+        left = geom["indent"] + i * (geom["swatch_w"] + geom["gap"])
+        rainbow = [(255, 70, 70), (255, 210, 70), (110, 255, 110), (90, 170, 255)]
+        for k, c in enumerate(rainbow):
+            file.write(f"\x1b[{geom['row']};{left + 1 + k}H")
+            file.write(f"\x1b[38;2;{c[0]};{c[1]};{c[2]}m")
+            file.write(f"\x1b[48;2;{c[0]};{c[1]};{c[2]}m")
+            file.write(HALF_BLOCK)
+            file.write(RESET)
 
     def _palette_geometry(self, layout: dict[str, int] | None = None) -> dict[str, int]:
         """Row/column layout of the visual color palette."""
@@ -386,13 +466,14 @@ class CanvasApp:
         file = self._console.file
         file.write(f"\x1b[{geom['indicator_row']};1H\x1b[2K")
         file.write(f"\x1b[{geom['row']};1H\x1b[2K")
-        marker_col = (
-            geom["indent"]
-            + self._palette_idx * (geom["swatch_w"] + geom["gap"])
-            + geom["swatch_w"] // 2
-        )
-        file.write(f"\x1b[{geom['indicator_row']};{marker_col + 1}H")
-        file.write("\x1b[38;2;255;255;255m▼\x1b[0m")
+        if self._palette_active:
+            marker_col = (
+                geom["indent"]
+                + self._palette_idx * (geom["swatch_w"] + geom["gap"])
+                + geom["swatch_w"] // 2
+            )
+            file.write(f"\x1b[{geom['indicator_row']};{marker_col + 1}H")
+            file.write("\x1b[38;2;255;255;255m▼\x1b[0m")
         for i, (name, color) in enumerate(PALETTE):
             left = geom["indent"] + i * (geom["swatch_w"] + geom["gap"])
             file.write(f"\x1b[{geom['row']};{left + 1}H")
@@ -409,19 +490,21 @@ class CanvasApp:
         """Row/columns of the toolbar: the button list, the brush bar, the row."""
         layout = layout or self._compute_layout()
         total = -1  # every item is followed by a 1-column gap; drop the last one
-        for ident, label, _action in _TOOLBAR_SPEC:
-            total += (BRUSH_MAX if ident == "brush_slider" else len(label)) + 1
-        indent = max(0, (layout["term_w"] - total) // 2)
+        for ident, label, icon, _action in _TOOLBAR_SPEC:
+            text = icon if self._icons else label
+            total += (BRUSH_MAX if ident == "brush_slider" else len(text)) + 1
+        indent = max(0, (layout["term_w"] - total) // 2)  # horizontally centered
         row = layout["top_pad"] + 2  # just below the header
         col = indent + 1
         buttons: list[ToolButton] = []
         slider: BrushSlider | None = None
-        for ident, label, action in _TOOLBAR_SPEC:
+        for ident, label, icon, action in _TOOLBAR_SPEC:
+            text = icon if self._icons else label
             if ident == "brush_slider":
                 slider = BrushSlider(row, col)
             else:
-                buttons.append(ToolButton(ident, label, action, row, col))
-            col += (BRUSH_MAX if ident == "brush_slider" else len(label)) + 1
+                buttons.append(ToolButton(ident, text, action, row, col))
+            col += (BRUSH_MAX if ident == "brush_slider" else len(text)) + 1
         return {"row": row, "indent": indent, "buttons": buttons, "slider": slider}
 
     def _render_toolbar(self) -> str:
@@ -457,9 +540,9 @@ class CanvasApp:
         self._console.file.write("\x1b[2J")
         self._old_cells = []
         self._old_header = ""
-        self._old_status = ""
         self._old_toolbar = ""
         self._old_palette_key = None
+        self._old_quick_key = None
         self._old_cursor_cell = None
         self._cursor_was_reversed = False
         self._draw_body()
@@ -513,6 +596,7 @@ class CanvasApp:
         geom = self._palette_geometry(layout)
         palette_key = (
             self._palette_idx,
+            self._palette_active,
             geom["indicator_row"],
             geom["row"],
             geom["indent"],
@@ -523,38 +607,84 @@ class CanvasApp:
             self._old_palette_key = palette_key
             self._render_palette_rows(layout, geom)
 
-        status = self._render_status()
-        if status != self._old_status:
-            file.write(f"\x1b[{layout['top_pad'] + 5 + layout['canvas_rows']};1H\x1b[2K")
-            file.write(status)
-            file.write(RESET)
-            self._old_status = status
+        qgeom = self._quick_geometry(layout)
+        quick_key = (
+            self._quick_idx,
+            qgeom["row"],
+            qgeom["indent"],
+            qgeom["swatch_w"],
+            qgeom["gap"],
+        )
+        if quick_key != self._old_quick_key:
+            self._old_quick_key = quick_key
+            self._render_quick_colors(layout, qgeom)
 
         # Park the terminal cursor below everything so it never wanders.
         file.write(f"\x1b[{layout['top_pad'] + 6 + layout['canvas_rows']};1H")
         file.flush()
 
     def _render_cursor(self, rows: list[list[Cell]]) -> None:
-        """Draw the blinking cursor over its cell; restore the old cell on move."""
+        """Draw the blinking cursor over its cell; restore the old cell on move.
+
+        Reverse video alone is invisible when the cell's two pixels share a
+        colour (e.g. an empty canvas, where fg == bg), so the cursor is also
+        framed by bright ``[ ]`` brackets on the same row whenever the blink is
+        "on" — its position stays unambiguous even on a blank canvas.
+        """
         file = self._console.file
         new_cursor = self._cursor_cell()
         blink = self._blink_active
         if new_cursor != self._old_cursor_cell:
-            if self._old_cursor_cell is not None and self._cursor_was_reversed:
-                cy, cx = self._old_cursor_cell
-                if cy < len(rows) and cx < len(rows[cy]):
-                    self._write_cell(file, cy, cx, rows[cy][cx], reverse=False)
+            if self._old_cursor_cell is not None:
+                self._restore_cursor_at(file, rows, *self._old_cursor_cell)
             self._old_cursor_cell = new_cursor
             if new_cursor is not None:
-                cy, cx = new_cursor
-                if cy < len(rows) and cx < len(rows[cy]):
-                    self._write_cell(file, cy, cx, rows[cy][cx], reverse=blink)
+                self._draw_cursor_at(file, rows, *new_cursor, blink)
             self._cursor_was_reversed = blink
         elif blink != self._cursor_was_reversed and new_cursor is not None:
-            cy, cx = new_cursor
-            if cy < len(rows) and cx < len(rows[cy]):
-                self._write_cell(file, cy, cx, rows[cy][cx], reverse=blink)
+            if blink:
+                self._draw_cursor_at(file, rows, *new_cursor, True)
+            else:
+                self._restore_cursor_at(file, rows, *new_cursor)
             self._cursor_was_reversed = blink
+
+    def _draw_cursor_at(self, file: Any, rows: list[list[Cell]], dy: int, x: int, blink: bool) -> None:
+        """Draw the cursor cell (reversed while blinking on) plus its brackets."""
+        if dy < len(rows) and x < len(rows[dy]):
+            self._write_cell(file, dy, x, rows[dy][x], reverse=blink)
+        if not blink:
+            return  # brackets only show during the "on" blink phase
+        layout = self._layout()
+        row = layout["top_pad"] + 3 + dy
+        left = layout["left_pad"] + x * CELL_W          # the column before the cell
+        right = layout["left_pad"] + (x + 1) * CELL_W + 1  # the column after it
+        frame = "\x1b[1;38;2;255;255;255m\x1b[48;2;0;0;0m"  # bright on black: always visible
+        if 1 <= left <= layout["term_w"]:
+            file.write(f"\x1b[{row};{left}H{frame}[{RESET}")
+        if 1 <= right <= layout["term_w"]:
+            file.write(f"\x1b[{row};{right}H{frame}]{RESET}")
+
+    def _restore_cursor_at(self, file: Any, rows: list[list[Cell]], dy: int, x: int) -> None:
+        """Redraw the cursor cell and its bracket neighbours plain from ``rows``."""
+        if dy >= len(rows):
+            return
+        layout = self._layout()
+        row = layout["top_pad"] + 3 + dy
+        width = len(rows[dy])
+        if x < width:
+            self._write_cell(file, dy, x, rows[dy][x], reverse=False)
+        if x - 1 >= 0:
+            self._write_cell(file, dy, x - 1, rows[dy][x - 1])
+        else:  # the left bracket was in the padding column: clear it
+            col = layout["left_pad"] + x * CELL_W
+            if 1 <= col <= layout["term_w"]:
+                file.write(f"\x1b[{row};{col}H ")
+        if x + 1 < width:
+            self._write_cell(file, dy, x + 1, rows[dy][x + 1])
+        else:  # the right bracket was in the padding column: clear it
+            col = layout["left_pad"] + (x + 1) * CELL_W + 1
+            if 1 <= col <= layout["term_w"]:
+                file.write(f"\x1b[{row};{col}H ")
 
     def _redraw_chrome(self) -> None:
         """Redraw only the non-canvas parts: header, cursor, toolbar, palette,
@@ -578,6 +708,7 @@ class CanvasApp:
             geom = self._palette_geometry(layout)
             palette_key = (
                 self._palette_idx,
+                self._palette_active,
                 geom["indicator_row"],
                 geom["row"],
                 geom["indent"],
@@ -595,12 +726,17 @@ class CanvasApp:
                 file.write(RESET)
                 self._old_toolbar = toolbar
 
-            status = self._render_status()
-            if status != self._old_status:
-                file.write(f"\x1b[{layout['top_pad'] + 5 + layout['canvas_rows']};1H\x1b[2K")
-                file.write(status)
-                file.write(RESET)
-                self._old_status = status
+            qgeom = self._quick_geometry(layout)
+            quick_key = (
+                self._quick_idx,
+                qgeom["row"],
+                qgeom["indent"],
+                qgeom["swatch_w"],
+                qgeom["gap"],
+            )
+            if quick_key != self._old_quick_key:
+                self._old_quick_key = quick_key
+                self._render_quick_colors(layout, qgeom)
 
             # Park the terminal cursor below everything so it never wanders.
             file.write(f"\x1b[{layout['top_pad'] + 6 + layout['canvas_rows']};1H")
@@ -662,22 +798,28 @@ class CanvasApp:
             self._cursor_y = min(max(self._cursor_y + dy, 0), self._height - 1)
 
     def _cycle_color(self) -> None:
-        self._palette_idx = (self._palette_idx + 1) % len(PALETTE)
-        self._color = PALETTE[self._palette_idx][1]
-        self._pending_chrome = True
+        self._select_color((self._palette_idx + 1) % len(PALETTE))
 
     def _select_color(self, index: int) -> None:
         self._palette_idx = index % len(PALETTE)
         self._color = PALETTE[self._palette_idx][1]
+        self._palette_active = True
+        self._quick_idx = None
         self._pending_chrome = True
 
-    def _toggle_paint(self) -> list[dict[str, Any]]:
-        """Paint the brush at the cursor; if already that colour, erase it."""
-        cx, cy = self._cursor_x, self._cursor_y
-        color = self._brush_color()
-        if self._pixels[cy][cx] == color:
-            color = self._background
-        return self._paint(cx, cy, color)
+    def _select_quick_color(self, index: int) -> None:
+        self._quick_idx = index % len(QUICK_COLORS)
+        self._color = QUICK_COLORS[self._quick_idx][1]
+        self._palette_active = False
+        self._pending_chrome = True
+
+    def _paint_at_cursor(self) -> list[dict[str, Any]]:
+        """Paint the brush at the cursor with the current color (idempotent).
+
+        Painting a pixel that already has that color is a no-op — space never
+        toggles a pixel back to the background; ``x`` is the explicit erase.
+        """
+        return self._paint(self._cursor_x, self._cursor_y, self._brush_color())
 
     def _erase(self) -> list[dict[str, Any]]:
         return self._paint(self._cursor_x, self._cursor_y, self._background)
@@ -716,7 +858,7 @@ class CanvasApp:
         return []
 
     def _tool_paint(self) -> list[dict[str, Any]]:
-        return self._toggle_paint()
+        return self._paint_at_cursor()
 
     def _tool_eraser(self) -> list[dict[str, Any]]:
         self._eraser = not self._eraser
@@ -777,14 +919,18 @@ class CanvasApp:
     def _handle_mouse(
         self, button: int, col: int, row: int, pressed: bool
     ) -> list[dict[str, Any]]:
-        """SGR mouse event: toolbar button / brush bar, palette swatch, or paint.
+        """SGR mouse event: toolbar button / brush bar, palette swatch, quick-
+        colour swatch, or paint.
 
         A click on the canvas fills both halves of the cell under the cursor
         with the brush. Toolbar and swatch clicks act like the matching
         keyboard shortcut (and leave palette mode, mirroring keyboard behaviour).
+        Any click also cancels an in-progress custom-colour hex input.
         """
         if not pressed or button not in (0, 32):
             return []
+        if self._custom_color_mode:
+            self._exit_custom_color()
         geom = self._toolbar_geometry()
         if row == geom["row"]:
             slider = geom["slider"]
@@ -806,6 +952,16 @@ class CanvasApp:
                 self._palette_mode = False
             self._select_color(idx)
             return []
+        quick = self._quick_hit(col, row)
+        if quick is not None:
+            if self._palette_mode:
+                self._palette_mode = False
+            if quick == "custom":
+                self._open_custom_color()
+            else:
+                self._select_quick_color(quick)
+            self._pending_chrome = True
+            return []
         hit = self._screen_cell(col, row)
         if hit is None:
             return []
@@ -820,8 +976,46 @@ class CanvasApp:
                 changes.append(change)
         return changes
 
+    def _quick_hit(self, col: int, row: int) -> int | str | None:
+        """The quick-colour a click landed on, ``"custom"`` for the rainbow
+        swatch, or None (not on the quick-colour row)."""
+        geom = self._quick_geometry()
+        if row != geom["row"]:
+            return None
+        idx = (col - 1 - geom["indent"]) // (geom["swatch_w"] + geom["gap"])
+        if 0 <= idx < len(QUICK_COLORS):
+            return idx
+        if idx == len(QUICK_COLORS):
+            return "custom"
+        return None
+
+    def _open_custom_color(self) -> None:
+        """Enter hex-input mode (typing ``#rrggbb``, Enter picks, Esc cancels)."""
+        self._custom_color_mode = True
+        self._hex_buffer = ""
+        self._pending_chrome = True
+
+    def _exit_custom_color(self) -> None:
+        self._custom_color_mode = False
+        self._hex_buffer = ""
+        self._pending_chrome = True
+
     def _handle_char(self, ch: str) -> list[dict[str, Any]]:
         """Handle a plain (non-escape) key. Returns the pixel changes, if any."""
+        if self._custom_color_mode:
+            if ch in "0123456789abcdefABCDEF" and len(self._hex_buffer) < 6:
+                self._hex_buffer += ch.lower()
+                self._pending_chrome = True
+            elif ch in ("\x7f", "\x08"):  # backspace
+                self._hex_buffer = self._hex_buffer[:-1]
+                self._pending_chrome = True
+            elif ch in ("\r", "\n"):
+                if len(self._hex_buffer) == 6:
+                    self._color = parse_hex("#" + self._hex_buffer)
+                    self._exit_custom_color()
+            elif ch == "\t":
+                self._exit_custom_color()
+            return []  # hex mode swallows every other key
         if ch == "q":
             self._quit.set()
             return []
@@ -837,7 +1031,7 @@ class CanvasApp:
             self._palette_mode = False  # any other key leaves palette mode
             self._pending_chrome = True
         if ch == " ":
-            return self._toggle_paint()
+            return self._paint_at_cursor()
         if ch == "x":
             return self._erase()
         if ch == "e":
@@ -867,6 +1061,8 @@ class CanvasApp:
     def _handle_csi(self, params: str, final: str) -> list[dict[str, Any]]:
         """Handle one CSI sequence. Returns the pixel changes, if any."""
         if final in ("A", "B", "C", "D"):
+            if self._custom_color_mode:
+                return []  # arrows do nothing mid hex input
             dx, dy = {"A": (0, -1), "B": (0, 1), "C": (1, 0), "D": (-1, 0)}[final]
             if self._palette_mode:
                 self._select_color(self._palette_idx + dx + dy * 4)
@@ -899,6 +1095,8 @@ class CanvasApp:
         except (OSError, ValueError):
             return []
         if second != b"[":
+            if self._custom_color_mode:
+                self._exit_custom_color()  # a stray Esc cancels the hex input
             return []  # Alt+key or a stray ESC: ignore
         buf = ""
         while True:

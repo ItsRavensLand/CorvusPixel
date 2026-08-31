@@ -33,11 +33,14 @@ connected to this session's socket. Draw, then ask Claude to look at it
 - **Mouse** — click the toolbar above the canvas to activate any tool (paint,
   eraser, brush size, palette, column/row resize, quit); click a slot on the
   brush bar (or drag its `●` handle) to size the brush; click a palette swatch
-  to pick a color; click (or click-drag) on the canvas to paint with the brush.
+  or a swatch in the bottom colour row to pick a color (the rainbow swatch at
+  the end opens a small hex input — type six hex digits, Enter to pick, Esc to
+  cancel); click (or click-drag) on the canvas to paint with the brush.
 - **Keyboard**
-  - arrow keys — move the cursor (a blinking reverse-video block, always
-    visible at the current pixel)
-  - `space` — paint/toggle the pixels at the cursor with the current color
+  - arrow keys — move the cursor (a blinking reverse-video block framed by
+    `[ ]` brackets, so it stays visible even on an empty canvas)
+  - `space` — paint the pixels at the cursor with the current color
+    (idempotent: painting the same pixel twice never toggles it back)
   - `x` — erase at the cursor
   - `e` — toggle the eraser tool (paints the background color)
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
@@ -109,13 +112,19 @@ background color = the pixel below it, so one terminal row shows two canvas
 rows. To make the pixels read as squares, each logical pixel is drawn `CELL_W`
 (2) terminal columns wide — a pixel is 2 columns × half a row, which looks
 square on the common ~1:2 terminal fonts. The whole canvas is centred in the
-terminal — a clickable toolbar (tool buttons + brush-size bar) sits one row above
-it, included in the centering math — and everything re-centres when you resize
-the window. The cursor is a blinking reverse-video block at the current pixel.
-rich's `Live` context manages terminal lifecycle; the cell diffing is our own,
-because stock `Live` redraws its whole region on every refresh (flicker). Input
-is parsed directly from stdin (arrow-key CSI sequences and SGR mouse reports);
-the toolbar buttons and brush bar are small custom clickable regions hit-tested
+terminal — a clickable toolbar (tool buttons + brush-size bar) sits one row
+above it, included in the centering math — and everything re-centres when you
+resize the window. Below the canvas sit two colour rows: the 8-swatch palette
+(arrow keys + Tab, or click) and an always-visible row of common colours
+ending in a rainbow "custom colour" swatch that opens a hex input. The toolbar
+renders single-width Unicode icons when the terminal supports them
+(`CORVUSPIXEL_ICONS=0` forces text labels). The cursor is a blinking
+reverse-video block framed by `[ ]` brackets, so it stays visible even on a
+blank canvas where reverse video alone would be invisible. rich's `Live`
+context manages terminal lifecycle; the cell diffing is our own, because stock
+`Live` redraws its whole region on every refresh (flicker). Input is parsed
+directly from stdin (arrow-key CSI sequences and SGR mouse reports); the
+toolbar buttons and brush bar are small custom clickable regions hit-tested
 over those same mouse reports rather than a widget framework — the diff-only
 renderer is the core requirement and a framework would fight it.
 

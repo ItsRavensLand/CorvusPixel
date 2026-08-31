@@ -223,8 +223,9 @@ def test_renderer_draws_initial_full_state() -> None:
     })
     rendered = out.getvalue()
     assert "CorvusPixel" in rendered  # header
-    # 4 cells x 2 columns each + 1 cursor cell x 2 + 8 swatches x 4 half-blocks
-    assert rendered.count("▀") == 8 + 2 + 32
+    # 4 cells x 2 columns + 1 cursor cell x 2 + 8 palette swatches x 4 +
+    # 8 quick-colour swatches x 4 + the 4-column rainbow custom swatch
+    assert rendered.count("▀") == 8 + 2 + 32 + 32 + 4
     assert "\x1b[38;2;255;0;0m" in rendered  # top pixel = red foreground
     assert "\x1b[48;2;0;0;0m" in rendered  # bottom pixel = black background
     # first canvas cell sits at the centered position (row 19, col 37)

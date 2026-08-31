@@ -20,6 +20,7 @@ from canvas_app import (
     MAX_CANVAS,
     MIN_CANVAS,
     PALETTE,
+    QUICK_COLORS,
     CanvasApp,
     ToolButton,
 )
@@ -101,13 +102,30 @@ def test_space_paints_at_cursor():
     assert app._pixels[0][0] == (255, 0, 0)
 
 
-def test_space_toggles_back_to_background():
+def test_space_paints_idempotently():
+    """Painting the same pixel twice keeps the colour — it must not toggle."""
     app = make_app()
     app._color = (255, 0, 0)
     app._handle_char(" ")
+    assert app._pixels[0][0] == (255, 0, 0)
+    second = app._handle_char(" ")  # repeat paint: no-op, stays red
+    assert second == []
+    assert app._pixels[0][0] == (255, 0, 0)
+
+
+def test_eraser_is_the_only_way_to_unpaint():
+    """Toggling the eraser tool then painting erases; plain paint never does."""
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._handle_char(" ")
+    app._handle_char("e")  # eraser on
     changes = app._handle_char(" ")
     assert changes == [{"x": 0, "y": 0, "color": [10, 10, 10]}]
     assert app._pixels[0][0] == (10, 10, 10)
+    app._handle_char("e")  # eraser off again
+    assert app._pixels[0][0] == (10, 10, 10)  # still background
+    app._handle_char(" ")  # plain paint returns
+    assert app._pixels[0][0] == (255, 0, 0)
 
 
 def test_x_erases_to_background():
@@ -366,6 +384,41 @@ def test_cursor_blink_phase_flips_render():
     assert "\x1b[7m" in out.getvalue()[len(first) + len(delta):]
 
 
+def test_cursor_blinks_over_time_via_pump():
+    """The runtime blink path: _pump() syncs _blink_active from _blink_on() and
+    redraws, so the cursor cell alternates reversed/plain every ~500 ms."""
+    app = make_app()
+    out = app._console.file
+    first = out.getvalue()
+
+    app._blink_on = lambda: False
+    app._pump()
+    assert app._blink_active is False
+    off = out.getvalue()[len(first):]
+    assert "\x1b[7m" not in off  # cursor restored plain
+    assert "\x1b[48;2;0;0;0m]" not in off  # bracket frame hidden in the off phase
+
+    app._blink_on = lambda: True
+    app._pump()
+    assert app._blink_active is True
+    on = out.getvalue()[len(first) + len(off):]
+    assert "\x1b[7m" in on  # cursor reversed again
+    assert "\x1b[48;2;0;0;0m]" in on  # and framed by its brackets
+
+
+def test_cursor_brackets_always_visible_on_blank_canvas():
+    """On an empty canvas reverse video is invisible (fg == bg), so the cursor
+    is framed by bright brackets that make its position unambiguous."""
+    app = make_app()
+    rendered = app._console.file.getvalue()
+    l = app._layout_info
+    cursor_row = l["top_pad"] + 3  # cursor at (0,0)
+    # right bracket: one column past the cursor cell, drawn bright-on-black
+    right = f"\x1b[{cursor_row};{l['left_pad'] + CELL_W + 1}H"
+    assert right in rendered
+    assert "\x1b[48;2;0;0;0m]\x1b[0m" in rendered
+
+
 # --------------------------------------------------------------------------- #
 # Square pixels: 2 terminal columns per logical pixel (with half-block rows)
 # --------------------------------------------------------------------------- #
@@ -459,6 +512,14 @@ def test_toolbar_paint_button_paints_at_cursor():
     app._color = (255, 0, 0)
     changes = click_toolbar(app, "paint")
     assert changes == [{"x": 0, "y": 0, "color": [255, 0, 0]}]
+    assert app._pixels[0][0] == (255, 0, 0)
+
+
+def test_toolbar_paint_button_paints_idempotently():
+    app = make_app()
+    app._color = (255, 0, 0)
+    click_toolbar(app, "paint")
+    assert click_toolbar(app, "paint") == []  # repeat paint: no toggle back
     assert app._pixels[0][0] == (255, 0, 0)
 
 
@@ -648,3 +709,194 @@ def test_swatch_click_while_in_palette_mode_confirms():
     app._handle_csi(f"<0;{col};{row}", "M")
     assert app._palette_mode is False  # a swatch click acts like Enter
     assert app._color == PALETTE[4][1]
+
+
+# --------------------------------------------------------------------------- #
+# Toolbar centering + Unicode icons
+# --------------------------------------------------------------------------- #
+
+
+def test_toolbar_is_horizontally_centered():
+    for size in [(80, 24), (120, 40)]:  # wide enough for the text-mode toolbar
+        app = make_app(size=size)
+        g = app._toolbar_geometry(app._layout_info)
+        buttons = g["buttons"]
+        assert buttons
+        first = buttons[0].col
+        last = buttons[-1].col + buttons[-1].width - 1
+        # padding on the left of the toolbar matches the padding on the right
+        assert abs((first - 1) - (size[0] - last)) <= 1
+        assert g["indent"] == max(0, (size[0] - 69) // 2)  # text mode: 69 cols
+
+
+def test_toolbar_too_narrow_clamps_to_left():
+    app = make_app(size=(40, 24))
+    g = app._toolbar_geometry(app._layout_info)
+    assert g["indent"] == 0  # doesn't overflow the terminal, clamps to the left
+
+
+def test_toolbar_icons_render_when_enabled():
+    app = make_app()
+    assert app._icons is False  # StringIO console has no encoding -> text fallback
+    app._icons = True
+    rendered = app._render_toolbar()
+    assert "[Paint]" not in rendered
+    assert "●" in rendered  # paint icon
+    b = toolbar_button(app, "paint")
+    assert b.width == 1  # icons are single-width, so geometry shrinks
+    app._eraser = True
+    assert "\x1b[7m▨" in app._render_toolbar()  # active tool still reverses
+
+
+def test_toolbar_icons_fit_narrow_terminals_and_stay_centered():
+    app = make_app(size=(40, 24))
+    app._icons = True
+    g = app._toolbar_geometry(app._layout_info)
+    buttons = g["buttons"]
+    first = buttons[0].col
+    last = buttons[-1].col + buttons[-1].width - 1
+    assert abs((first - 1) - (40 - last)) <= 1  # centered even at 40 cols
+
+
+def test_icons_override_env_forces_icons():
+    import os
+
+    app = make_app()
+    try:
+        os.environ["CORVUSPIXEL_ICONS"] = "1"
+        assert app._use_icons() is True
+        os.environ["CORVUSPIXEL_ICONS"] = "0"
+        assert app._use_icons() is False
+    finally:
+        del os.environ["CORVUSPIXEL_ICONS"]
+
+
+# --------------------------------------------------------------------------- #
+# Bottom colour row: quick colours + custom-colour hex input
+# --------------------------------------------------------------------------- #
+
+
+def quick_swatch_screen(app: CanvasApp, idx: int) -> tuple[int, int]:
+    """Terminal (1-based col, row) of a quick-colour swatch (0 = orange)."""
+    g = app._quick_geometry()
+    return (g["indent"] + idx * (g["swatch_w"] + g["gap"]) + 1, g["row"])
+
+
+def custom_swatch_screen(app: CanvasApp) -> tuple[int, int]:
+    """Terminal (1-based col, row) of the rainbow custom-colour swatch."""
+    g = app._quick_geometry()
+    idx = len(QUICK_COLORS)
+    return (g["indent"] + idx * (g["swatch_w"] + g["gap"]) + 1, g["row"])
+
+
+def test_quick_colors_row_replaces_the_legend():
+    app = make_app()
+    rendered = app._console.file.getvalue()
+    assert "mouse:" not in rendered  # the old keyboard-shortcut legend is gone
+    g = app._quick_geometry()
+    assert f"\x1b[{g['row']};1H\x1b[2K" in rendered  # quick row drawn
+    # a quick swatch is a solid 4-column half-block block
+    assert f"\x1b[{g['row']};{g['indent'] + 1}H" in rendered
+
+
+def test_quick_swatch_click_selects_color():
+    app = make_app()
+    col, row = quick_swatch_screen(app, 0)  # orange
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
+    assert changes == []  # a colour pick never paints pixels
+    assert app._color == QUICK_COLORS[0][1]
+    assert app._quick_idx == 0
+    assert app._palette_active is False  # the palette highlight gives way
+
+
+def test_quick_swatch_click_while_in_palette_mode_confirms():
+    app = make_app()
+    app._handle_char("\t")
+    col, row = quick_swatch_screen(app, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._palette_mode is False
+    assert app._color == QUICK_COLORS[2][1]
+
+
+def test_quick_swatch_is_reversed_when_selected():
+    app = make_app()
+    out = app._console.file
+    first = len(out.getvalue())
+    app._select_quick_color(3)
+    app._after_edit([])  # chrome-only redraw writes the quick row
+    delta = out.getvalue()[first:]
+    g = app._quick_geometry()
+    idx = g["indent"] + 3 * (g["swatch_w"] + g["gap"]) + 1
+    assert f"\x1b[{g['row']};{idx}H" in delta  # selected swatch position
+    assert "\x1b[7m" in delta  # ... drawn reversed
+
+
+def test_palette_swatch_click_clears_quick_highlight():
+    app = make_app()
+    app._select_quick_color(1)
+    col, row = palette_swatch_screen(app, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._quick_idx is None
+    assert app._palette_active is True
+    assert app._color == PALETTE[2][1]
+
+
+def test_custom_color_swatch_opens_hex_input_and_confirms():
+    app = make_app()
+    col, row = custom_swatch_screen(app)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._custom_color_mode is True
+    for ch in "ffA0b3":
+        app._handle_char(ch)
+    assert app._hex_buffer == "ffa0b3"
+    app._handle_char("\r")
+    assert app._custom_color_mode is False
+    assert app._color == (0xFF, 0xA0, 0xB3)
+
+
+def test_custom_color_hex_input_limits_and_backspace():
+    app = make_app()
+    app._open_custom_color()
+    for ch in "abcdef12":  # 8 chars, only 6 are kept
+        app._handle_char(ch)
+    assert app._hex_buffer == "abcdef"
+    app._handle_char("\x7f")  # backspace
+    assert app._hex_buffer == "abcde"
+    app._handle_char("\x7f")
+    assert app._hex_buffer == "abcd"
+
+
+def test_custom_color_hex_input_enter_requires_six_digits():
+    app = make_app()
+    app._open_custom_color()
+    app._handle_char("ff")
+    app._handle_char("\r")  # only 2 digits: ignored, still in hex mode
+    assert app._custom_color_mode is True
+    assert app._color == PALETTE[0][1]
+
+
+def test_custom_color_hex_input_cancels_on_escape():
+    app = make_app()
+    app._open_custom_color()
+    app._handle_char("1")
+    app._read_escape_sequence()  # a stray Esc arrives (input stream is empty)
+    assert app._custom_color_mode is False
+    assert app._hex_buffer == ""
+
+
+def test_mouse_click_cancels_custom_color_input():
+    app = make_app()
+    app._open_custom_color()
+    app._handle_char("ff")
+    col, row = cell_screen(app, 2, 0)
+    app._handle_csi(f"<0;{col};{row}", "M")  # click on the canvas
+    assert app._custom_color_mode is False
+    assert app._hex_buffer == ""
+
+
+def test_click_outside_bottom_row_is_ignored():
+    app = make_app()
+    g = app._quick_geometry()
+    # one row below the quick-colour row: nothing there to click
+    assert app._handle_csi(f"<0;{g['indent'] + 2};{g['row'] + 1}", "M") == []
+    assert app._pixels[0][0] == (10, 10, 10)
