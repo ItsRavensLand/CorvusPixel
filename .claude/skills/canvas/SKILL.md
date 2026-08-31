@@ -11,9 +11,20 @@ socket. This is the one command to remember — no tool names needed.
 ## 1. Confirm the MCP server is registered
 
 The `open_canvas` and `canvas_status` tools come from the CorvusPixel MCP
-server. If they are not available in this session, the server is not
-registered — run `./setup.sh`, then ask the user to restart Claude Code so the
-tools load. Do not call `open_canvas()` until the tools exist.
+server. If they are not available in this session, the server isn't registered
+for this session. Decide how to respond from where this session is running:
+
+- **Inside the CorvusPixel project** — the session's working directory is (or
+  is under) the repo root; you can confirm cheaply, e.g. `ls server.py` and
+  `grep -l CorvusPixel CLAUDE.md`, or `git remote -v` showing
+  `ItsRavensLand/CorvusPixel`. Then tell the user to run `./setup.sh` to
+  register the server and restart Claude Code so the tools load.
+- **Outside the project** — say plainly: "This command only works inside the
+  CorvusPixel project. cd into the project directory and start Claude Code
+  there (e.g. `cd /path/to/CorvusPixel && claude`), then run /canvas again."
+  Do not mention `./setup.sh` (it only exists inside the project).
+
+Do not call `open_canvas()` until the tools exist.
 
 ## 2. Don't open a duplicate window
 
