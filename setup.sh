@@ -19,21 +19,22 @@ if [ ! -d "$PROJECT_DIR/.git" ]; then
     git -C "$PROJECT_DIR" init
 fi
 
-echo "==> 3/3  Register MCP server with Claude Code (project scope)"
+echo "==> 3/3  Register MCP server with Claude Code (user scope)"
 if command -v claude >/dev/null 2>&1; then
-    claude mcp add --scope project corvuspixel -- \
+    claude mcp add --scope user corvuspixel -- \
         "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/server.py"
 else
     echo "!! 'claude' CLI not found — skipping MCP registration."
     echo "   Install it, then run:"
-    echo "   claude mcp add --scope project corvuspixel -- $PROJECT_DIR/.venv/bin/python $PROJECT_DIR/server.py"
+    echo "   claude mcp add --scope user corvuspixel -- $PROJECT_DIR/.venv/bin/python $PROJECT_DIR/server.py"
 fi
 
 cat <<'EOF'
 
-CorvusPixel is ready. In Claude Code, call the open_canvas tool to open the
-interactive canvas window. Draw with your mouse/keyboard, read it back with
-see_canvas, and ask Claude to draw only when you want it to.
+CorvusPixel is ready. The server is registered at user scope, so in any
+Claude Code session on this machine (any directory) just type /canvas to open
+the interactive drawing window. Draw with your mouse/keyboard, read it back
+with see_canvas, and ask Claude to draw only when you want it to.
 
 Manual run (optional, if you skip MCP registration):
   terminal 1:  <project>/.venv/bin/python <project>/server.py

@@ -8,13 +8,14 @@ in tokens) and only draws itself when you ask. No files, real time.
 ## Quick start
 
 ```bash
-./setup.sh   # once: create .venv, install deps, register the MCP server
+./setup.sh   # once: create .venv, install deps, register the MCP server at user scope
 ```
 
-Register the CorvusPixel MCP server once, then in any Claude Code session in
-this project just type **`/canvas`** to open the drawing window — no need to
-remember tool names. Add an optional size: `/canvas 64x64` opens a fresh
-64×64 canvas.
+Run `setup.sh` once from this project. It registers the CorvusPixel MCP server
+at **user scope**, so from then on **`/canvas` works from any directory** — you
+don't need to `cd` into CorvusPixel first. Just type **`/canvas`** in any
+Claude Code session on this machine to open the drawing window. Add an optional
+size: `/canvas 64x64` opens a fresh 64×64 canvas.
 
 ```text
 Claude Code > /canvas
