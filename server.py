@@ -253,6 +253,25 @@ class PixelCanvas:
         self.background = color
         return changes
 
+    def resize(self, new_w: int, new_h: int) -> None:
+        """Resize the canvas, keeping the top-left region where it still fits.
+
+        Grown cells take the background color; pixels outside the new size are
+        dropped (the canvas grows/shrinks at the right and bottom edges).
+        Dimensions must stay positive.
+        """
+        if new_w <= 0 or new_h <= 0:
+            raise ValueError("width and height must be positive")
+        if new_w == self.width and new_h == self.height:
+            return
+        old = self._pixels
+        old_w, old_h = self.width, self.height
+        self._pixels = [[self.background] * new_w for _ in range(new_h)]
+        self.width, self.height = new_w, new_h
+        for y in range(min(old_h, new_h)):
+            for x in range(min(old_w, new_w)):
+                self._pixels[y][x] = old[y][x]
+
     def _check_bounds(self, x: int, y: int) -> None:
         if not (0 <= x < self.width and 0 <= y < self.height):
             raise ValueError(f"({x}, {y}) is outside the {self.width}x{self.height} canvas")
@@ -301,7 +320,8 @@ class RendererSink:
     change is pushed as an incremental ``update`` message carrying only the
     changed cells. The reverse direction is user input: windows send
     ``{"type": "edit", "changes": [...]}``, which ``on_edit`` delivers to the
-    server to apply and rebroadcast.
+    server to apply and rebroadcast, and ``{"type": "resize", width, height}``,
+    which ``on_resize`` delivers so the server can keep its canvas in sync.
     """
 
     def __init__(self, socket_path: str) -> None:
@@ -311,6 +331,7 @@ class RendererSink:
         self._stop = threading.Event()
         self._snapshot_provider: Callable[[], dict[str, Any]] | None = None
         self._on_edit: Callable[[list[CellChange]], None] | None = None
+        self._on_resize: Callable[[int, int], None] | None = None
         self._server: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._reader_threads: set[threading.Thread] = set()
@@ -323,9 +344,11 @@ class RendererSink:
         self,
         snapshot_provider: Callable[[], dict[str, Any]],
         on_edit: Callable[[list[CellChange]], None] | None = None,
+        on_resize: Callable[[int, int], None] | None = None,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._on_edit = on_edit
+        self._on_resize = on_resize
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             os.unlink(self._socket_path)  # clear a stale socket from a dead run
@@ -381,13 +404,16 @@ class RendererSink:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if message.get("type") != "edit" or self._on_edit is None:
-                    continue
-                changes = [
-                    CellChange(c["x"], c["y"], tuple(c["color"]))
-                    for c in message.get("changes", [])
-                ]
-                self._on_edit(changes)
+                if message.get("type") == "edit" and self._on_edit is not None:
+                    changes = [
+                        CellChange(c["x"], c["y"], tuple(c["color"]))
+                        for c in message.get("changes", [])
+                    ]
+                    self._on_edit(changes)
+                elif message.get("type") == "resize" and self._on_resize is not None:
+                    w, h = message.get("width"), message.get("height")
+                    if isinstance(w, int) and isinstance(h, int):
+                        self._on_resize(w, h)
         except OSError:
             pass
         finally:
@@ -457,7 +483,9 @@ class CanvasServer:
 
     def start(self) -> None:
         """Start accepting canvas-window connections (call before ``server.run()``)."""
-        self._sink.start(self.snapshot, on_edit=self._apply_edits)
+        self._sink.start(
+            self.snapshot, on_edit=self._apply_edits, on_resize=self._resize_canvas
+        )
 
     def close(self) -> None:
         self._sink.close()
@@ -483,6 +511,17 @@ class CanvasServer:
                 except ValueError:
                     continue  # out-of-bounds from a misbehaving window: ignore
             self._publish(applied)
+
+    def _resize_canvas(self, width: int, height: int) -> None:
+        """Resize the canvas from a window, preserving pixels that still fit."""
+        with self._lock:
+            width = max(1, min(width, 100))
+            height = max(1, min(height, 100))
+            if (width, height) == (self._canvas.width, self._canvas.height):
+                return
+            self._canvas.resize(width, height)
+            # Dimensions changed: every window must re-sync from a fresh snapshot.
+            self._sink.push({"type": "full", **self._canvas.snapshot()})
 
     # -- the eight tool bodies ----------------------------------------------
 
@@ -721,9 +760,10 @@ def open_canvas() -> str:
 
     The window connects to this session's canvas socket. Draw with the mouse
     (click / click-drag) or keyboard (arrow keys move the cursor, space paints,
-    x erases, c cycles the palette, 1-8 pick a color, q quits). Changes appear
-    here instantly; read them back with see_canvas(). Fails if no compatible
-    terminal is found.
+    x erases, e toggles the eraser, +/- changes the brush size, c cycles the
+    palette, 1-8 pick a color, Tab opens the visual palette, [ ] / { } grow or
+    shrink the canvas, q quits). Changes appear here instantly; read them back
+    with see_canvas(). Fails if no compatible terminal is found.
     """
     state = _server()
     launched = _launch_canvas_window(state.socket_path)
@@ -734,8 +774,9 @@ def open_canvas() -> str:
     pid = f" (launcher pid {launched.pid})" if launched.pid else ""
     return (
         f"Opened the canvas in a new {launched.terminal}{pid}. "
-        "Mouse: click/drag to paint. Keys: arrows move, space paint/toggle, "
-        "x erase, c next color, 1-8 palette, q quit."
+        "Mouse: click/drag to paint. Keys: arrows move, space paint, x erase, "
+        "e eraser, +/- brush size, c next color, 1-8 palette, [ ]/ { } resize, "
+        "q quit."
     )
 
 

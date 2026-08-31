@@ -30,15 +30,26 @@ connected to this session's socket. Draw, then ask Claude to look at it
 
 ## Drawing in the canvas window
 
-- **Mouse** — click to paint the cell under the cursor; click and drag to paint
-  a line. A click paints both halves of the cell (one display cell = two canvas
-  rows).
+- **Mouse** — click paints the cell under the cursor; click and drag to paint
+  a stroke. Clicking a palette swatch picks that color.
 - **Keyboard**
-  - arrow keys — move the cursor (reverse-video cell)
-  - `space` — paint/toggle the pixel at the cursor with the current color
-  - `x` — erase the pixel at the cursor
+  - arrow keys — move the cursor (a blinking reverse-video block, always
+    visible at the current pixel)
+  - `space` — paint/toggle the pixels at the cursor with the current color
+  - `x` — erase at the cursor
+  - `e` — toggle the eraser tool (paints the background color)
+  - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor)
+  - `[`/`]` — shrink/grow the canvas width (right edge) ·
+    `{`/`}` — shrink/grow the height (bottom edge)
   - `c` — cycle the palette · `1`–`8` — pick a palette color directly
+  - `Tab` — open the visual palette; arrow keys move the highlight,
+    Enter/space confirms
   - `q` or Ctrl+C — quit the window
+
+The brush is a square centred on the cursor, and every paint (keyboard or
+mouse) stamps the whole square — a 3×3 brush paints a 3×3 block around where
+you aim. Resizing the canvas keeps every pixel that still fits and drops the
+rest at the right/bottom edges; the server's copy (and `see_canvas`) follows.
 
 Every edit is applied locally for instant feedback and written back to the
 server, which rebroadcasts it to every connected window.
@@ -63,8 +74,9 @@ If you skip MCP registration:
 2. **`canvas_app.py`** — the interactive window. Connects to the server's socket
    (retrying forever), renders the canvas with diff-only truecolor `▀`
    half-blocks, and turns keyboard/mouse input into pixel edits that are applied
-   locally and sent back to the server as `{"type": "edit", ...}`. The server
-   applies them and rebroadcasts.
+   locally and sent back to the server as `{"type": "edit", ...}` (and canvas
+   size changes as `{"type": "resize", ...}`). The server applies them and
+   rebroadcasts.
 3. **Session-scoped socket** — the socket path is derived from the server's
    parent PID (the Claude Code session that spawned it), e.g.
    `/tmp/corvuspixel-<ppid>.sock`. A window opened from this session always talks
@@ -91,11 +103,15 @@ reconnects, and each reconnect re-syncs from a fresh full snapshot).
 
 Each display cell is the `▀` character: foreground color = top canvas pixel,
 background color = the pixel below it, so one terminal row shows two canvas
-rows. rich's `Live` context manages terminal lifecycle; the cell diffing is our
-own, because stock `Live` redraws its whole region on every refresh (flicker).
-Input is parsed directly from stdin (arrow-key CSI sequences and SGR mouse
-reports) rather than pulling in a widget framework — the diff-only renderer is
-the core requirement and a framework would fight it.
+rows. To make the pixels read as squares, each logical pixel is drawn `CELL_W`
+(2) terminal columns wide — a pixel is 2 columns × half a row, which looks
+square on the common ~1:2 terminal fonts. The whole canvas is centred in the
+terminal and re-centres when you resize the window. The cursor is a blinking
+reverse-video block at the current pixel. rich's `Live` context manages terminal
+lifecycle; the cell diffing is our own, because stock `Live` redraws its whole
+region on every refresh (flicker). Input is parsed directly from stdin (arrow-key
+CSI sequences and SGR mouse reports) rather than pulling in a widget framework —
+the diff-only renderer is the core requirement and a framework would fight it.
 
 ## Requirements
 

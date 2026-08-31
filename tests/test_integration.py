@@ -157,6 +157,44 @@ def test_see_canvas_reflects_user_edits() -> None:
             cs.close()
 
 
+def test_server_resizes_canvas_from_window_message() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "resize.sock")
+        cs = CanvasServer(sock_path, width=4, height=4, background=(0, 0, 0))
+        cs.start()
+        fake = FakeRenderer(sock_path)
+        try:
+            fake.connect()
+            fake.read_message()  # the initial full snapshot
+
+            cs.set_pixel(0, 0, "#ff0000")
+            fake.read_message()  # the update
+
+            # A window asks to grow the canvas at the right/bottom edges.
+            app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            app.connect(sock_path)
+            app.sendall(
+                (json.dumps({"type": "resize", "width": 6, "height": 5}) + "\n").encode()
+            )
+
+            # The resize is rebroadcast as a fresh full snapshot.
+            msg = fake.read_message()
+            assert msg["type"] == "full"
+            assert msg["width"] == 6 and msg["height"] == 5
+            assert msg["pixels"][0][0] == [255, 0, 0]  # preserved
+            assert msg["pixels"][0][5] == [0, 0, 0]  # new column = background
+
+            data = json.loads(cs.get_canvas())
+            assert data["width"] == 6 and data["height"] == 5
+            assert data["pixels"][0][0] == [255, 0, 0]
+            out = cs.see_canvas()  # compact view reflects the new size
+            assert "Canvas 6x5" in out
+            app.close()
+        finally:
+            cs.close()
+            fake.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. Renderer: applies messages and draws only the cells that changed
 # --------------------------------------------------------------------------- #
@@ -168,7 +206,11 @@ def test_renderer_draws_initial_full_state() -> None:
         file=out, force_terminal=True, color_system="truecolor",
         width=80, height=40, force_interactive=True, legacy_windows=False,
     )
-    r = CanvasApp("/tmp/nonexistent.sock", background=(0, 0, 0), console=console)
+    r = CanvasApp(
+        "/tmp/nonexistent.sock", background=(0, 0, 0), console=console,
+        size_provider=lambda: (80, 40),
+    )
+    r._blink_active = True
     r._apply({
         "type": "full",
         "width": 4,
@@ -181,9 +223,13 @@ def test_renderer_draws_initial_full_state() -> None:
     })
     rendered = out.getvalue()
     assert "CorvusPixel" in rendered  # header
-    assert rendered.count("▀") == 5  # 4 cells + 1 reverse-video cursor overlay
+    # 4 cells x 2 columns each + 1 cursor cell x 2 + 8 swatches x 4 half-blocks
+    assert rendered.count("▀") == 8 + 2 + 32
     assert "\x1b[38;2;255;0;0m" in rendered  # top pixel = red foreground
     assert "\x1b[48;2;0;0;0m" in rendered  # bottom pixel = black background
+    # first canvas cell sits at the centered position (row 19, col 37)
+    l = r._layout_info
+    assert f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + 1}H" in rendered
 
 
 def test_renderer_rewrites_only_changed_cell() -> None:
@@ -192,7 +238,11 @@ def test_renderer_rewrites_only_changed_cell() -> None:
         file=out, force_terminal=True, color_system="truecolor",
         width=80, height=40, force_interactive=True, legacy_windows=False,
     )
-    r = CanvasApp("/tmp/nonexistent.sock", background=(0, 0, 0), console=console)
+    r = CanvasApp(
+        "/tmp/nonexistent.sock", background=(0, 0, 0), console=console,
+        size_provider=lambda: (80, 40),
+    )
+    r._blink_active = True
     full = {
         "type": "full",
         "width": 4,
@@ -209,9 +259,10 @@ def test_renderer_rewrites_only_changed_cell() -> None:
     # change pixel (0,0) from red to blue: only that display cell is rewritten
     r._apply({"type": "update", "changes": [{"x": 0, "y": 0, "color": [0, 0, 255]}]})
     delta = out.getvalue()[len(first):]
-    assert delta.count("▀") == 1  # exactly one cell redrawn, not the whole canvas
+    l = r._layout_info
+    assert delta.count("▀") == 2  # one cell, two half-block columns
     assert "\x1b[38;2;0;0;255m" in delta  # the new blue foreground
-    assert "\x1b[2;1H" in delta  # positioned at the first canvas row's first cell
+    assert f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + 1}H" in delta  # centered cell
 
 
 # --------------------------------------------------------------------------- #

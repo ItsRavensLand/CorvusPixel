@@ -1,8 +1,10 @@
-"""Tests for the interactive canvas app's input handling.
+"""Tests for the interactive canvas app's input handling and rendering.
 
 These drive the input handlers directly with synthetic bytes/events — no real
 terminal needed. They verify that keyboard and mouse input produce the correct
-pixel writes on the app's copy of the canvas.
+pixel writes on the app's copy of the canvas, that the square-pixel + centering
+math is right, that the cursor always renders at the current pixel, and that
+interactive resize preserves/discards data at the edges.
 
 Run with:  .venv/bin/python -m pytest
 """
@@ -11,7 +13,14 @@ import io
 
 from rich.console import Console
 
-from canvas_app import CanvasApp, PALETTE
+from canvas_app import (
+    BRUSH_MAX,
+    CELL_W,
+    MAX_CANVAS,
+    MIN_CANVAS,
+    PALETTE,
+    CanvasApp,
+)
 
 FULL = {
     "type": "full",
@@ -21,23 +30,42 @@ FULL = {
     "pixels": [[[10, 10, 10]] * 4 for _ in range(4)],
 }
 
+# With a 4x4 canvas in an 80x40 terminal:
+#   canvas_rows = 2, content height = 1 + 2 + 2 + 1 = 6
+#   top_pad = (40-6)//2 = 17, left_pad = (80 - 4*2)//2 = 36
+SIZE = (80, 40)
+CONTENT_H = 6
 
-def make_app() -> CanvasApp:
+
+def make_app(size=SIZE) -> CanvasApp:
     out = io.StringIO()
     console = Console(
         file=out, force_terminal=True, color_system="truecolor",
-        width=80, height=40, force_interactive=True, legacy_windows=False,
+        width=size[0], height=size[1], force_interactive=True, legacy_windows=False,
     )
     app = CanvasApp(
         "/tmp/nonexistent.sock", background=(10, 10, 10),
-        console=console, input_stream=io.StringIO(),
+        console=console, input_stream=io.StringIO(), size_provider=lambda: size,
     )
+    app._blink_active = True  # deterministic cursor for rendering tests
     app._apply(FULL)  # set the canvas + dimensions, like the first socket message
     return app
 
 
+def cell_screen(app: CanvasApp, x: int, dy: int) -> tuple[int, int]:
+    """Terminal (1-based col, row) of the top-left of a canvas display cell."""
+    l = app._layout_info
+    return (l["left_pad"] + x * CELL_W + 1, l["top_pad"] + 2 + dy)
+
+
+def palette_swatch_screen(app: CanvasApp, idx: int) -> tuple[int, int]:
+    """Terminal (1-based col, row) of a palette swatch."""
+    g = app._palette_geometry()
+    return (g["indent"] + idx * (g["swatch_w"] + g["gap"]) + 1, g["row"])
+
+
 # --------------------------------------------------------------------------- #
-# Keyboard: painting
+# Keyboard: painting (single-pixel brush)
 # --------------------------------------------------------------------------- #
 
 
@@ -101,15 +129,16 @@ def test_arrow_keys_move_cursor_within_bounds():
 
 
 # --------------------------------------------------------------------------- #
-# Mouse: click and click-drag painting (SGR coordinates are 1-based terminal
-# rows; row 1 is the header, so row 2 is the first canvas row)
+# Mouse: click and click-drag painting (SGR coords are 1-based; the header is
+# at row top_pad+1, the first canvas display row at top_pad+2)
 # --------------------------------------------------------------------------- #
 
 
 def test_mouse_click_paints_both_halves_of_cell():
     app = make_app()
     app._color = (0, 255, 0)
-    changes = app._handle_csi("<0;3;2", "M")  # click at terminal (col 3, row 2)
+    col, row = cell_screen(app, 2, 0)  # pixel (2, 0) and (2, 1)
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
     assert changes == [
         {"x": 2, "y": 0, "color": [0, 255, 0]},
         {"x": 2, "y": 1, "color": [0, 255, 0]},
@@ -120,7 +149,8 @@ def test_mouse_click_paints_both_halves_of_cell():
 def test_mouse_drag_paints():
     app = make_app()
     app._color = (1, 2, 3)
-    changes = app._handle_csi("<32;2;3", "M")  # drag to (col 1, row 3)
+    col, row = cell_screen(app, 1, 1)  # drag to pixel (1, 2) and (1, 3)
+    changes = app._handle_csi(f"<32;{col};{row}", "M")
     assert changes == [
         {"x": 1, "y": 2, "color": [1, 2, 3]},
         {"x": 1, "y": 3, "color": [1, 2, 3]},
@@ -130,22 +160,266 @@ def test_mouse_drag_paints():
 def test_mouse_release_does_not_paint():
     app = make_app()
     app._color = (1, 2, 3)
-    assert app._handle_csi("<0;2;2", "m") == []  # 'm' = release
+    col, row = cell_screen(app, 2, 0)
+    assert app._handle_csi(f"<0;{col};{row}", "m") == []  # 'm' = release
 
 
 def test_mouse_click_on_header_is_ignored():
     app = make_app()
     app._color = (1, 2, 3)
-    assert app._handle_csi("<0;5;1", "M") == []  # row 1 is the header
+    l = app._layout_info
+    assert app._handle_csi(f"<0;5;{l['top_pad'] + 1}", "M") == []  # header row
 
 
 def test_mouse_right_button_does_not_paint():
     app = make_app()
     app._color = (1, 2, 3)
-    assert app._handle_csi("<2;2;2", "M") == []  # button 2 = right
+    col, row = cell_screen(app, 2, 0)
+    assert app._handle_csi(f"<2;{col};{row}", "M") == []  # button 2 = right
 
 
 def test_mouse_click_out_of_bounds_is_ignored():
     app = make_app()
     app._color = (1, 2, 3)
-    assert app._handle_csi("<0;99;2", "M") == []
+    assert app._handle_csi("<0;999;2", "M") == []
+
+
+# --------------------------------------------------------------------------- #
+# Brush tools: eraser + adjustable square brush size
+# --------------------------------------------------------------------------- #
+
+
+def test_brush_size_applies_square():
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._cursor_x, app._cursor_y = 2, 2
+    app._brush_size = 3
+    changes = app._handle_char(" ")
+    assert len(changes) == 9
+    assert {(c["x"], c["y"]) for c in changes} == {
+        (x, y) for y in range(1, 4) for x in range(1, 4)
+    }
+    assert all(c["color"] == [255, 0, 0] for c in changes)
+    assert app._pixels[2][2] == (255, 0, 0)
+
+
+def test_brush_size_clips_at_edges():
+    app = make_app()
+    app._color = (0, 255, 0)
+    app._brush_size = 3
+    # cursor at (0,0): only the bottom-right quadrant of the brush fits
+    changes = app._handle_char(" ")
+    assert {(c["x"], c["y"]) for c in changes} == {(0, 0), (1, 0), (0, 1), (1, 1)}
+
+
+def test_brush_size_cycle_hotkeys():
+    app = make_app()
+    app._handle_char("+")
+    assert app._brush_size == 2
+    app._handle_char("=")
+    assert app._brush_size == 3
+    app._handle_char("-")
+    assert app._brush_size == 2
+    app._brush_size = BRUSH_MAX
+    app._handle_char("+")  # clamps at the top
+    assert app._brush_size == BRUSH_MAX
+    app._handle_char("-")  # from the top
+    assert app._brush_size == BRUSH_MAX - 1
+
+
+def test_eraser_paints_background():
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._pixels[2][1] = (255, 255, 255)
+    app._cursor_x, app._cursor_y = 1, 2
+    app._handle_char("e")
+    assert app._eraser is True
+    changes = app._handle_char(" ")
+    assert changes == [{"x": 1, "y": 2, "color": [10, 10, 10]}]
+    app._handle_char("e")
+    assert app._eraser is False
+
+
+def test_eraser_with_mouse():
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._pixels[0][1] = (255, 255, 255)
+    app._pixels[1][1] = (255, 255, 255)
+    app._handle_char("e")
+    col, row = cell_screen(app, 1, 0)
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
+    assert {(c["x"], c["y"]) for c in changes} == {(1, 0), (1, 1)}
+    assert all(c["color"] == [10, 10, 10] for c in changes)
+
+
+# --------------------------------------------------------------------------- #
+# Visual color palette: swatches selected by arrow keys or mouse click
+# --------------------------------------------------------------------------- #
+
+
+def test_palette_swatch_click_selects_color():
+    app = make_app()
+    col, row = palette_swatch_screen(app, 2)  # red
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
+    assert changes == []  # a palette click never paints pixels
+    assert app._palette_idx == 2
+    assert app._color == (255, 0, 0)
+
+
+def test_mouse_click_on_palette_indicator_row_is_ignored():
+    app = make_app()
+    g = app._palette_geometry()
+    changes = app._handle_csi(f"<0;{g['indent'] + 2};{g['indicator_row']}", "M")
+    assert changes == []
+
+
+def test_palette_mode_arrows_and_confirm():
+    app = make_app()
+    app._handle_char("\t")
+    assert app._palette_mode is True
+    app._handle_csi("", "C")  # right -> index 1
+    assert app._palette_idx == 1
+    app._handle_csi("", "B")  # down -> +4
+    assert app._palette_idx == 5
+    app._handle_csi("", "A")  # up -> -4
+    assert app._palette_idx == 1
+    app._handle_char(" ")  # confirm -> exit palette mode
+    assert app._palette_mode is False
+    assert app._color == PALETTE[1][1]
+
+
+def test_palette_mode_tab_toggles_off():
+    app = make_app()
+    app._handle_char("\t")
+    assert app._palette_mode is True
+    app._handle_char("\t")
+    assert app._palette_mode is False
+
+
+# --------------------------------------------------------------------------- #
+# Visible cursor: always rendered (reversed) at the current pixel, tracking
+# cleanly with no leftover artifacts at the previous position
+# --------------------------------------------------------------------------- #
+
+
+def test_cursor_renders_at_position_and_tracks():
+    app = make_app()
+    out = app._console.file
+    first = out.getvalue()
+    l = app._layout_info
+    pos_cell = lambda x: f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + x * CELL_W + 1}H"
+
+    # move to (1,0): old cell (0,0) restored plain, new cell (1,0) reversed
+    app._cursor_x, app._cursor_y = 1, 0
+    app._draw()
+    delta = out.getvalue()[len(first):]
+    assert pos_cell(1) in delta  # cursor now at (1,0)
+    assert "\x1b[7m" in delta
+    idx = delta.find(pos_cell(0))
+    assert idx != -1 and "\x1b[7m" not in delta[idx:idx + 40]  # old cell plain
+
+    # move back to (0,0): the (1,0) cell is restored plain, (0,0) reversed
+    second = out.getvalue()
+    app._cursor_x, app._cursor_y = 0, 0
+    app._draw()
+    delta2 = out.getvalue()[len(second):]
+    assert pos_cell(0) in delta2
+    assert "\x1b[7m" in delta2
+    idx2 = delta2.find(pos_cell(1))
+    assert idx2 != -1 and "\x1b[7m" not in delta2[idx2:idx2 + 40]
+
+
+def test_cursor_blink_phase_flips_render():
+    app = make_app()
+    out = app._console.file
+    first = out.getvalue()
+    app._blink_active = False  # blink phase turns off
+    app._draw()
+    delta = out.getvalue()[len(first):]
+    assert "\x1b[7m" not in delta  # cursor rendered plain while blinking off
+    app._blink_active = True
+    app._draw()
+    assert "\x1b[7m" in out.getvalue()[len(first) + len(delta):]
+
+
+# --------------------------------------------------------------------------- #
+# Square pixels: 2 terminal columns per logical pixel (with half-block rows)
+# --------------------------------------------------------------------------- #
+
+
+def test_square_pixel_two_columns():
+    app = make_app()
+    out = app._console.file
+    first = len(out.getvalue())
+    app._apply({"type": "update", "changes": [{"x": 0, "y": 0, "color": [255, 0, 0]}]})
+    delta = out.getvalue()[first:]
+    l = app._layout_info
+    assert f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + 1}H" in delta
+    assert delta.count("▀") == 2  # exactly one cell = two half-block columns
+    assert "▀▀" in delta
+
+
+# --------------------------------------------------------------------------- #
+# Canvas centering at a few terminal sizes
+# --------------------------------------------------------------------------- #
+
+
+def test_canvas_centering_at_terminal_sizes():
+    for size in [(80, 24), (120, 40), (60, 20)]:
+        app = make_app(size=size)
+        out = app._console.file
+        l = app._layout_info
+        assert l["content_h"] == CONTENT_H  # header + 2 canvas rows + palette + status
+        assert l["top_pad"] == max(0, (size[1] - CONTENT_H) // 2)
+        assert l["left_pad"] == max(0, (size[0] - 4 * CELL_W) // 2)
+        assert f"\x1b[{l['top_pad'] + 1};1H" in out.getvalue()  # header is centered
+
+
+# --------------------------------------------------------------------------- #
+# Interactive resize: preserve where it fits, discard at the edges
+# --------------------------------------------------------------------------- #
+
+
+def test_resize_local_preserves_and_discards():
+    app = make_app()
+    app._pixels[0][0] = (255, 0, 0)
+    app._pixels[1][1] = (0, 255, 0)
+    app._request_resize(1, 0)  # grow width 4 -> 5 (new column at the right)
+    assert app._width == 5
+    assert app._pixels[0][0] == (255, 0, 0)  # preserved
+    assert app._pixels[0][4] == (10, 10, 10)  # new column = background
+    app._request_resize(0, 1)  # grow height 4 -> 5 (new row at the bottom)
+    assert app._height == 5
+    assert app._pixels[4][4] == (10, 10, 10)
+    app._request_resize(-1, 0)  # shrink width 5 -> 4 (right column dropped)
+    assert app._width == 4
+    assert app._pixels[0][3] == (10, 10, 10)  # dropped column's data gone
+    assert app._pixels[0][0] == (255, 0, 0)  # still fits -> preserved
+    app._request_resize(0, -1)  # shrink height 5 -> 4 (bottom row dropped)
+    assert app._height == 4
+    assert app._pixels[1][1] == (0, 255, 0)
+
+
+def test_resize_cursor_clamps():
+    app = make_app()
+    app._cursor_x, app._cursor_y = 3, 3
+    app._request_resize(-1, -1)
+    assert (app._cursor_x, app._cursor_y) == (2, 2)
+
+
+def test_resize_clamps_at_bounds():
+    app = make_app()
+    for _ in range(200):
+        app._request_resize(1, 0)
+    assert app._width == MAX_CANVAS
+    for _ in range(200):
+        app._request_resize(-1, 0)
+    assert app._width == MIN_CANVAS
+
+
+def test_resize_pending_is_sent_and_cleared():
+    app = make_app()
+    app._request_resize(1, 0)
+    assert app._pending_resize == (5, 4)
+    app._after_edit([])  # no socket in tests -> send is a no-op, flag still clears
+    assert app._pending_resize is None

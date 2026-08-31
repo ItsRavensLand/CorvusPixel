@@ -72,6 +72,31 @@ def test_clear_returns_only_actual_diffs():
     assert c.clear((0, 0, 0)) == []
 
 
+def test_resize_preserves_top_left_and_fills_new():
+    c = PixelCanvas(4, 4, (0, 0, 0))
+    c.fill_rect(0, 0, 3, 3, (255, 0, 0))  # paints x/y 0..2
+    c.resize(6, 5)
+    assert c.width == 6 and c.height == 5
+    assert c.get(2, 2) == (255, 0, 0)  # still fits -> preserved
+    assert c.get(0, 3) == (0, 0, 0)  # untouched old area stays background
+    assert c.get(5, 4) == (0, 0, 0)  # grown area = background
+    c.resize(2, 2)
+    assert c.width == 2 and c.height == 2
+    assert c.get(1, 1) == (255, 0, 0)  # kept
+    c.resize(2, 2)  # same size is a no-op
+    assert c.width == 2 and c.height == 2
+
+
+def test_resize_rejects_non_positive():
+    c = PixelCanvas(4, 4)
+    for w, h in ((0, 4), (4, 0), (0, 0), (-1, 4)):
+        try:
+            c.resize(w, h)
+            assert False, f"resize({w}, {h}) should have raised"
+        except ValueError:
+            pass
+
+
 def test_snapshot_is_json_serializable():
     c = PixelCanvas(2, 2, (1, 2, 3))
     c.set_pixel(0, 0, (255, 0, 0))

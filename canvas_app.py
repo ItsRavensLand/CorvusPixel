@@ -1,28 +1,39 @@
 """CorvusPixel interactive canvas — the window the *user* draws in.
 
 This replaces the old passive renderer. It connects to the MCP server's
-session-scoped Unix socket, renders the shared canvas live (diff-only, truecolor
-``▀`` half-blocks — each terminal row shows two canvas rows), and lets the user
+session-scoped Unix socket, renders the shared canvas live, and lets the user
 draw:
 
-- **Keyboard**: arrow keys move the cursor; ``space`` paints/toggles the pixel
-  under the cursor to the current color; ``x`` erases it; ``c`` cycles the
-  palette; ``1``-``8`` pick a palette color directly; ``q`` or Ctrl+C quits.
-- **Mouse**: click (or click-drag) paints the clicked cell, via SGR mouse-mode
-  reporting.
+- **Keyboard**: arrow keys move the cursor; ``space`` paints (or toggles) with
+  the current brush; ``x`` erases; ``e`` toggles the eraser tool; ``+``/``-``
+  grow/shrink the square brush; ``[``/``]`` and ``{``/``}`` grow/shrink the
+  canvas (columns at the right edge, rows at the bottom edge); ``c`` cycles the
+  palette; ``1``-``8`` pick a palette color; ``Tab`` opens the visual palette
+  (arrow keys + Enter/space select); ``q`` or Ctrl+C quits.
+- **Mouse**: click (or click-drag) paints with the current brush via SGR
+  mouse-mode reporting; clicking a palette swatch selects that color.
+- **Layout**: the canvas is centered in the terminal (horizontally and
+  vertically) and re-centered when the terminal is resized (SIGWINCH). The
+  cursor is a blinking reverse-video block that always sits at the current
+  pixel, wherever it is.
+
+Rendering: each logical pixel is drawn as ``CELL_W`` (2) terminal columns of a
+half-block ``▀``, so one display cell spans two canvas rows *and* two terminal
+columns — pixels read as squares on the common ~1:2 terminal fonts. Diff-only
+repainting is unchanged: only the cells whose content changed are rewritten.
 
 Every user edit is applied locally for instant feedback (no round-trip wait)
-*and* written back to the server as ``{"type": "edit", "changes": [...]}``. The
-server is the single source of truth: it applies the edit and rebroadcasts an
-``update`` to every connected window.
+*and* written back to the server as ``{"type": "edit", "changes": [...]}``.
+Canvas size changes go back as ``{"type": "resize", "width", "height"}``; the
+server keeps its canvas (and ``see_canvas``) in sync.
 
-Why raw ANSI instead of textual? The canvas is a grid of half-block cells that
-must repaint only the cells that changed — no full-region redraws. That is the
-core rendering requirement here, and it is simplest with our own ANSI cell-diff
-on top of rich's ``Live`` lifecycle context. Terminal input (arrow keys, SGR
-mouse) arrives as byte sequences on stdin, which we parse directly; pulling in
-a full widget framework (textual) would add a large dependency without helping
-the diff-only renderer.
+Why raw ANSI instead of textual? The canvas is a grid of cells that must repaint
+only the cells that changed — no full-region redraws. That is the core rendering
+requirement here, and it is simplest with our own ANSI cell-diff on top of
+rich's ``Live`` lifecycle context. Terminal input (arrow keys, SGR mouse) arrives
+as byte sequences on stdin, which we parse directly; pulling in a full widget
+framework (textual) would add a large dependency without helping the diff-only
+renderer.
 """
 
 from __future__ import annotations
@@ -30,13 +41,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import signal
 import socket
 import sys
 import termios
 import threading
 import time
 import tty
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console
 from rich.live import Live
@@ -52,9 +65,21 @@ Cell = tuple[Color, Color]  # (top pixel, bottom pixel) for one display cell
 RESET = "\x1b[0m"
 HALF_BLOCK = "▀"
 
+# Each logical pixel is CELL_W terminal columns wide (2). Combined with the
+# half-block vertical split (each pixel is also half a terminal row tall), a
+# pixel is CELL_W x 0.5 terminal cells — square on the common ~1:2 fonts.
+CELL_W = 2
+CELL_CH = HALF_BLOCK * CELL_W  # the characters that draw one logical pixel
+
+BRUSH_MIN = 1
+BRUSH_MAX = 7  # square brush side lengths: 1x1 .. 7x7
+MIN_CANVAS = 1
+MAX_CANVAS = 100
+
 DEFAULT_SOCKET = os.environ.get("CORVUSPIXEL_SOCK", "/tmp/corvuspixel.sock")
 
-# The brush palette: (name, color). Keys 1-8 select these; 'c' cycles.
+# The brush palette: (name, color). Keys 1-8 select these; 'c' cycles; the
+# on-screen swatches let you pick with arrows (Tab) or a mouse click.
 PALETTE: list[tuple[str, Color]] = [
     ("white", (255, 255, 255)),
     ("black", (0, 0, 0)),
@@ -91,8 +116,9 @@ def hex_str(color: Color) -> str:
 class CanvasApp:
     """Draws the canvas and turns keyboard/mouse input into pixel edits.
 
-    ``console`` and ``input_stream`` are injectable so tests can capture output
-    and drive input without a real terminal.
+    ``console``, ``input_stream`` and ``size_provider`` are injectable so tests
+    can capture output, drive input and pin the terminal dimensions without a
+    real terminal.
     """
 
     def __init__(
@@ -101,6 +127,7 @@ class CanvasApp:
         background: Color = (0, 0, 0),
         console: Console | None = None,
         input_stream: Any = None,
+        size_provider: Callable[[], tuple[int, int]] | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._background = background
@@ -113,20 +140,82 @@ class CanvasApp:
         self._cursor_y = 0
         self._palette_idx = 0
         self._color = PALETTE[0][1]
+        self._palette_mode = False
+        self._eraser = False
+        self._brush_size = 1
+        self._pending_resize: tuple[int, int] | None = None
 
         self._sock: socket.socket | None = None
         self._quit = threading.Event()
         self._lock = threading.RLock()
         self._input_stream = input_stream if input_stream is not None else sys.stdin
         self._old_termios: Any = None
+        self._size_provider = size_provider
 
         self._console = console or Console(color_system="truecolor")
-        # What is currently drawn on screen (row 1 = header, rows 2+ = canvas,
-        # row len(rows)+2 = palette/help line).
+        # What is currently drawn on screen (all coordinates absolute, centered).
+        self._layout_info: dict[str, int] | None = None
+        self._force_full = True
         self._old_cells: list[list[Cell]] = []
         self._old_header = ""
         self._old_status = ""
+        self._old_palette_key: tuple[Any, ...] | None = None
         self._old_cursor_cell: tuple[int, int] | None = None
+        self._cursor_was_reversed = False
+        self._blink_active = self._blink_on()
+
+    # -- layout --------------------------------------------------------------
+
+    def _query_size(self) -> tuple[int, int]:
+        """Terminal size as (columns, lines); tests inject a provider."""
+        if self._size_provider is not None:
+            return self._size_provider()
+        size = shutil.get_terminal_size()
+        return size.columns, size.lines
+
+    def _compute_layout(self) -> dict[str, int]:
+        """Where everything sits: centering offsets for the current terminal."""
+        tw, th = self._query_size()
+        canvas_rows = max(1, (self._height + 1) // 2)  # ceil(height / 2)
+        # header + canvas + palette (indicator + swatches) + status
+        content_h = 1 + canvas_rows + 2 + 1
+        top_pad = max(0, (th - content_h) // 2)
+        left_pad = max(0, (tw - max(1, self._width) * CELL_W) // 2)
+        return {
+            "term_w": tw,
+            "term_h": th,
+            "canvas_rows": canvas_rows,
+            "content_h": content_h,
+            "top_pad": top_pad,
+            "left_pad": left_pad,
+        }
+
+    def _layout(self) -> dict[str, int]:
+        """The layout currently drawn (computes it on first use)."""
+        if self._layout_info is None:
+            self._layout_info = self._compute_layout()
+        return self._layout_info
+
+    def _blink_on(self) -> bool:
+        """Cursor blink phase — toggles ~every half second."""
+        return int(time.monotonic() * 2.0) % 2 == 0
+
+    def _install_winch_handler(self) -> None:
+        """Re-center on terminal resize. Best-effort (main thread only)."""
+        try:
+            signal.signal(signal.SIGWINCH, lambda _s, _f: self._mark_layout_dirty())
+        except (ValueError, AttributeError, OSError):
+            pass
+
+    def _mark_layout_dirty(self) -> None:
+        self._force_full = True
+
+    def _pump(self) -> None:
+        """Periodic upkeep: cursor blink + terminal-resize repaint."""
+        blink = self._blink_on()
+        if blink != self._blink_active or self._force_full:
+            self._blink_active = blink
+            self._draw()
 
     # -- socket message handling ---------------------------------------------
 
@@ -177,7 +266,7 @@ class CanvasApp:
         return rows
 
     def _cursor_cell(self) -> tuple[int, int] | None:
-        """The display cell the cursor is on: (row index, column)."""
+        """The display cell the cursor is on: (display row, column)."""
         if not self._pixels:
             return None
         return self._cursor_y // 2, self._cursor_x
@@ -193,95 +282,174 @@ class CanvasApp:
         )
 
     def _render_header(self) -> str:
-        status = (
+        tool = "eraser" if self._eraser else "paint"
+        text = (
             f"CorvusPixel  {self._width}x{self._height}  "
             f"{'● connected' if self._connected else '○ reconnecting…'}   "
             f"cursor ({self._cursor_x},{self._cursor_y})   "
-            f"color {hex_str(self._color)}"
+            f"brush {self._brush_size} · {tool}   {hex_str(self._color)}"
         )
-        return self._styled(status, "bold #7fd4ff")
+        if self._palette_mode:
+            text += "   palette: arrows move · enter select"
+        return self._styled(text, "bold #7fd4ff")
 
     def _render_status(self) -> str:
-        palette = "  ".join(
-            ("➤" if i == self._palette_idx else str(i + 1)) + " " + hex_str(color)
-            for i, (name, color) in enumerate(PALETTE)
-        )
         return (
-            "keys: arrows move · space paint/toggle · x erase · "
-            f"c next color · q quit   |   {palette}"
+            "keys: arrows move · space paint/toggle · x erase · e eraser · "
+            "+/- brush · [ ] cols · { } rows · tab palette · q quit"
         )
+
+    def _palette_geometry(self, layout: dict[str, int] | None = None) -> dict[str, int]:
+        """Row/column layout of the visual color palette."""
+        layout = layout or self._compute_layout()
+        swatch_w = CELL_W * 2
+        gap = 2
+        total = len(PALETTE) * (swatch_w + gap) - gap
+        indent = max(0, (layout["term_w"] - total) // 2)
+        return {
+            "indent": indent,
+            "swatch_w": swatch_w,
+            "gap": gap,
+            "indicator_row": layout["top_pad"] + 2 + layout["canvas_rows"],
+            "row": layout["top_pad"] + 3 + layout["canvas_rows"],
+        }
+
+    def _render_palette_rows(self, layout: dict[str, int], geom: dict[str, int]) -> None:
+        """Draw the swatch row plus a ``▼`` marker over the selected swatch."""
+        file = self._console.file
+        file.write(f"\x1b[{geom['indicator_row']};1H\x1b[2K")
+        file.write(f"\x1b[{geom['row']};1H\x1b[2K")
+        marker_col = (
+            geom["indent"]
+            + self._palette_idx * (geom["swatch_w"] + geom["gap"])
+            + geom["swatch_w"] // 2
+        )
+        file.write(f"\x1b[{geom['indicator_row']};{marker_col + 1}H")
+        file.write("\x1b[38;2;255;255;255m▼\x1b[0m")
+        for i, (name, color) in enumerate(PALETTE):
+            left = geom["indent"] + i * (geom["swatch_w"] + geom["gap"])
+            file.write(f"\x1b[{geom['row']};{left + 1}H")
+            file.write(f"\x1b[38;2;{color[0]};{color[1]};{color[2]}m")
+            file.write(f"\x1b[48;2;{color[0]};{color[1]};{color[2]}m")
+            if i == self._palette_idx:
+                file.write("\x1b[7m")
+            file.write(CELL_CH * (geom["swatch_w"] // CELL_W))
+            file.write(RESET)
 
     def _draw(self) -> None:
-        """Repaint only the header/cells/status that actually changed on screen."""
+        """Repaint only what changed. A layout change forces a full redraw."""
         with self._lock:
-            file = self._console.file
-            rows = self._display_rows()
+            new_layout = self._compute_layout()
+            if self._force_full or new_layout != self._layout_info:
+                self._force_full = False
+                self._layout_info = new_layout
+                self._full_redraw()
+                return
+            self._draw_body()
 
-            header = self._render_header()
-            if header != self._old_header:
-                file.write("\x1b[1;1H\x1b[2K")
-                file.write(header)
-                file.write(RESET)
-                self._old_header = header
+    def _full_redraw(self) -> None:
+        """Clear the whole screen and redraw from scratch (resize / re-centre)."""
+        self._console.file.write("\x1b[2J")
+        self._old_cells = []
+        self._old_header = ""
+        self._old_status = ""
+        self._old_palette_key = None
+        self._old_cursor_cell = None
+        self._cursor_was_reversed = False
+        self._draw_body()
 
-            old = self._old_cells
-            for y in range(max(len(old), len(rows))):
-                new_row = rows[y] if y < len(rows) else None
-                old_row = old[y] if y < len(old) else None
-                if new_row == old_row:
-                    continue
-                if new_row is None:
-                    # A row disappeared (canvas shrank): erase it.
-                    file.write(f"\x1b[{y + 2};1H\x1b[2K")
-                    continue
-                if old_row is None or len(new_row) != len(old_row):
-                    # A brand-new or resized row: erase it and write every cell.
-                    file.write(f"\x1b[{y + 2};1H\x1b[2K")
-                    for x, cell in enumerate(new_row):
+    def _draw_body(self) -> None:
+        file = self._console.file
+        layout = self._layout()
+        rows = self._display_rows()
+
+        header = self._render_header()
+        if header != self._old_header:
+            file.write(f"\x1b[{layout['top_pad'] + 1};1H\x1b[2K")
+            file.write(header)
+            file.write(RESET)
+            self._old_header = header
+
+        old = self._old_cells
+        for y in range(max(len(old), len(rows))):
+            new_row = rows[y] if y < len(rows) else None
+            old_row = old[y] if y < len(old) else None
+            if new_row == old_row:
+                continue
+            if new_row is None:
+                # A row disappeared (canvas shrank): erase it.
+                file.write(f"\x1b[{layout['top_pad'] + 2 + y};1H\x1b[2K")
+                continue
+            if old_row is None or len(new_row) != len(old_row):
+                # A brand-new or resized row: erase it and write every cell.
+                file.write(f"\x1b[{layout['top_pad'] + 2 + y};1H\x1b[2K")
+                for x, cell in enumerate(new_row):
+                    self._write_cell(file, y, x, cell)
+            else:
+                # Same size as before: rewrite exactly the cells that changed.
+                for x, (cell, prev) in enumerate(zip(new_row, old_row)):
+                    if cell != prev:
                         self._write_cell(file, y, x, cell)
-                else:
-                    # Same size as before: rewrite exactly the cells that changed.
-                    for x, (cell, prev) in enumerate(zip(new_row, old_row)):
-                        if cell != prev:
-                            self._write_cell(file, y, x, cell)
+        self._old_cells = rows
 
-            # Cursor overlay: reverse-video the cell under the cursor. When it
-            # moves, redraw the old cell plain and the new cell reversed.
-            new_cursor = self._cursor_cell()
-            if new_cursor != self._old_cursor_cell:
-                if self._old_cursor_cell is not None:
-                    cy, cx = self._old_cursor_cell
-                    if cy < len(old) and cy < len(rows) and cx < len(old[cy]):
-                        self._write_cell(file, cy, cx, old[cy][cx], reverse=False)
-                if new_cursor is not None:
-                    cy, cx = new_cursor
-                    if cy < len(rows) and cx < len(rows[cy]):
-                        self._write_cell(file, cy, cx, rows[cy][cx], reverse=True)
+        # Cursor overlay: a blinking reverse-video block at the cursor pixel.
+        # When it moves, restore the old cell; when the blink phase flips,
+        # redraw the cursor cell so it always tracks with no leftovers.
+        new_cursor = self._cursor_cell()
+        blink = self._blink_active
+        if new_cursor != self._old_cursor_cell:
+            if self._old_cursor_cell is not None and self._cursor_was_reversed:
+                cy, cx = self._old_cursor_cell
+                if cy < len(rows) and cx < len(rows[cy]):
+                    self._write_cell(file, cy, cx, rows[cy][cx], reverse=False)
             self._old_cursor_cell = new_cursor
+            if new_cursor is not None:
+                cy, cx = new_cursor
+                if cy < len(rows) and cx < len(rows[cy]):
+                    self._write_cell(file, cy, cx, rows[cy][cx], reverse=blink)
+            self._cursor_was_reversed = blink
+        elif blink != self._cursor_was_reversed and new_cursor is not None:
+            cy, cx = new_cursor
+            if cy < len(rows) and cx < len(rows[cy]):
+                self._write_cell(file, cy, cx, rows[cy][cx], reverse=blink)
+            self._cursor_was_reversed = blink
 
-            self._old_cells = rows
+        geom = self._palette_geometry(layout)
+        palette_key = (
+            self._palette_idx,
+            geom["indicator_row"],
+            geom["row"],
+            geom["indent"],
+            geom["swatch_w"],
+            geom["gap"],
+        )
+        if palette_key != self._old_palette_key:
+            self._old_palette_key = palette_key
+            self._render_palette_rows(layout, geom)
 
-            status = self._render_status()
-            if status != self._old_status:
-                file.write(f"\x1b[{len(rows) + 2};1H\x1b[2K")
-                file.write(status)
-                file.write(RESET)
-                self._old_status = status
+        status = self._render_status()
+        if status != self._old_status:
+            file.write(f"\x1b[{layout['top_pad'] + 4 + layout['canvas_rows']};1H\x1b[2K")
+            file.write(status)
+            file.write(RESET)
+            self._old_status = status
 
-            # Park the cursor below everything so it never wanders.
-            file.write(f"\x1b[{len(rows) + 3};1H")
-            file.flush()
+        # Park the terminal cursor below everything so it never wanders.
+        file.write(f"\x1b[{layout['top_pad'] + 5 + layout['canvas_rows']};1H")
+        file.flush()
 
-    @staticmethod
-    def _write_cell(file: Any, y: int, x: int, cell: Cell, reverse: bool = False) -> None:
+    def _write_cell(self, file: Any, y: int, x: int, cell: Cell, reverse: bool = False) -> None:
         """Move to a cell and draw it: fg = top pixel, bg = bottom pixel."""
+        layout = self._layout()
+        row = layout["top_pad"] + 2 + y  # row 1 is the header
+        col = layout["left_pad"] + x * CELL_W + 1
         (fr, fg, fb), (br, bg, bb) = cell
-        file.write(f"\x1b[{y + 2};{x + 1}H")  # row 1 is the header
+        file.write(f"\x1b[{row};{col}H")
         file.write(f"\x1b[38;2;{fr};{fg};{fb}m")
         file.write(f"\x1b[48;2;{br};{bg};{bb}m")
         if reverse:
             file.write("\x1b[7m")  # reverse video marks the cursor cell
-        file.write(HALF_BLOCK)
+        file.write(CELL_CH)
         file.write(RESET)
 
     # -- input handling ---------------------------------------------------------
@@ -292,6 +460,32 @@ class CanvasApp:
             return None
         self._pixels[y][x] = color
         return {"x": x, "y": y, "color": list(color)}
+
+    def _brush_rect(self, cx: int, cy: int) -> list[tuple[int, int]]:
+        """The pixels covered by the square brush centred on (cx, cy)."""
+        n = self._brush_size
+        half = n // 2
+        out: list[tuple[int, int]] = []
+        for y in range(cy - half, cy - half + n):
+            if not (0 <= y < self._height):
+                continue
+            for x in range(cx - half, cx - half + n):
+                if 0 <= x < self._width:
+                    out.append((x, y))
+        return out
+
+    def _paint(self, cx: int, cy: int, color: Color) -> list[dict[str, Any]]:
+        """Paint the brush square centred on (cx, cy); returns the changes."""
+        changes: list[dict[str, Any]] = []
+        for x, y in self._brush_rect(cx, cy):
+            change = self._paint_pixel(x, y, color)
+            if change is not None:
+                changes.append(change)
+        return changes
+
+    def _brush_color(self) -> Color:
+        """What the brush paints right now: eraser paints the background."""
+        return self._background if self._eraser else self._color
 
     def _move_cursor(self, dx: int, dy: int) -> None:
         if self._width:
@@ -308,36 +502,83 @@ class CanvasApp:
         self._color = PALETTE[self._palette_idx][1]
 
     def _toggle_paint(self) -> list[dict[str, Any]]:
-        """Paint the cursor pixel with the brush; if already that color, erase."""
-        x, y = self._cursor_x, self._cursor_y
-        current = self._pixels[y][x]
-        color = self._background if current == self._color else self._color
-        change = self._paint_pixel(x, y, color)
-        return [change] if change else []
+        """Paint the brush at the cursor; if already that colour, erase it."""
+        cx, cy = self._cursor_x, self._cursor_y
+        color = self._brush_color()
+        if self._pixels[cy][cx] == color:
+            color = self._background
+        return self._paint(cx, cy, color)
 
     def _erase(self) -> list[dict[str, Any]]:
-        change = self._paint_pixel(self._cursor_x, self._cursor_y, self._background)
-        return [change] if change else []
+        return self._paint(self._cursor_x, self._cursor_y, self._background)
+
+    def _resize_local(self, new_w: int, new_h: int) -> None:
+        """Resize the local copy, keeping the top-left region where it fits."""
+        old = self._pixels
+        old_w, old_h = self._width, self._height
+        self._width, self._height = new_w, new_h
+        self._pixels = [[self._background] * new_w for _ in range(new_h)]
+        for y in range(min(old_h, new_h)):
+            for x in range(min(old_w, new_w)):
+                self._pixels[y][x] = old[y][x]
+        self._cursor_x = min(self._cursor_x, max(0, new_w - 1))
+        self._cursor_y = min(self._cursor_y, max(0, new_h - 1))
+
+    def _request_resize(self, dw: int, dh: int) -> list[dict[str, Any]]:
+        """Grow/shrink the canvas at an edge; the server syncs on the next tick."""
+        w = min(max(self._width + dw, MIN_CANVAS), MAX_CANVAS)
+        h = min(max(self._height + dh, MIN_CANVAS), MAX_CANVAS)
+        if w == self._width and h == self._height:
+            return []
+        self._resize_local(w, h)
+        self._pending_resize = (w, h)
+        return []
+
+    def _screen_cell(self, col: int, row: int) -> tuple[int, int] | None:
+        """Map a terminal (1-based) col/row to a canvas cell, or None."""
+        layout = self._compute_layout()
+        rel = row - 1 - layout["top_pad"]  # 0-based; 0 = header row
+        if rel < 1:
+            return None
+        dy = rel - 1
+        if dy < 0 or dy >= layout["canvas_rows"]:
+            return None  # below the canvas (palette / status rows)
+        x = (col - 1 - layout["left_pad"]) // CELL_W
+        if x < 0 or x >= self._width:
+            return None
+        return x, dy
+
+    def _palette_hit(self, col: int, row: int) -> int | None:
+        """The palette index a click landed on, or None."""
+        geom = self._palette_geometry()
+        if row != geom["row"]:
+            return None
+        idx = (col - 1 - geom["indent"]) // (geom["swatch_w"] + geom["gap"])
+        if 0 <= idx < len(PALETTE):
+            return idx
+        return None
 
     def _handle_mouse(
         self, button: int, col: int, row: int, pressed: bool
     ) -> list[dict[str, Any]]:
-        """SGR mouse event. Paints the clicked display cell (both halves)."""
-        if not pressed:
+        """SGR mouse event: paint the clicked cell with the brush (or pick a
+        palette swatch). A click always fills both halves of the cell."""
+        if not pressed or button not in (0, 32):
             return []
-        # Buttons: 0 = left press, 32 = left button held while dragging.
-        if button not in (0, 32):
+        idx = self._palette_hit(col, row)
+        if idx is not None:
+            self._select_color(idx)
             return []
-        # Mouse coords are 1-based terminal rows; row 1 is the header.
-        cell_col = col - 1
-        display_row = row - 2
-        if display_row < 0 or cell_col < 0 or cell_col >= self._width:
+        hit = self._screen_cell(col, row)
+        if hit is None:
             return []
-        changes: list[dict[str, Any]] = []
-        for yy in (display_row * 2, display_row * 2 + 1):
-            if yy >= self._height:
-                continue
-            change = self._paint_pixel(cell_col, yy, self._color)
+        cell_col, display_row = hit
+        top_y = display_row * 2
+        color = self._brush_color()
+        changes = self._paint(cell_col, top_y, color)
+        bottom_y = top_y + 1
+        if bottom_y < self._height:
+            change = self._paint_pixel(cell_col, bottom_y, color)
             if change is not None:
                 changes.append(change)
         return changes
@@ -347,10 +588,35 @@ class CanvasApp:
         if ch == "q":
             self._quit.set()
             return []
+        if ch == "\t":
+            self._palette_mode = not self._palette_mode
+            return []
+        if self._palette_mode:
+            if ch in ("\r", "\n", " "):
+                self._palette_mode = False  # confirm the highlighted swatch
+                return []
+            self._palette_mode = False  # any other key leaves palette mode
         if ch == " ":
             return self._toggle_paint()
         if ch == "x":
             return self._erase()
+        if ch == "e":
+            self._eraser = not self._eraser
+            return []
+        if ch in "+=":
+            self._brush_size = min(self._brush_size + 1, BRUSH_MAX)
+            return []
+        if ch in "-_":
+            self._brush_size = max(self._brush_size - 1, BRUSH_MIN)
+            return []
+        if ch == "[":
+            return self._request_resize(-1, 0)
+        if ch == "]":
+            return self._request_resize(1, 0)
+        if ch == "{":
+            return self._request_resize(0, -1)
+        if ch == "}":
+            return self._request_resize(0, 1)
         if ch == "c":
             self._cycle_color()
             return []
@@ -363,6 +629,9 @@ class CanvasApp:
         """Handle one CSI sequence. Returns the pixel changes, if any."""
         if final in ("A", "B", "C", "D"):
             dx, dy = {"A": (0, -1), "B": (0, 1), "C": (1, 0), "D": (-1, 0)}[final]
+            if self._palette_mode:
+                self._select_color(self._palette_idx + dx + dy * 4)
+                return []
             self._move_cursor(dx, dy)
             return []
         if final in ("M", "m") and params.startswith("<"):
@@ -428,15 +697,29 @@ class CanvasApp:
             self._after_edit(changes)
 
     def _after_edit(self, changes: list[dict[str, Any]]) -> None:
-        """Apply changes locally (done already), redraw, and sync to the server."""
+        """Redraw and sync any edits/resizes to the server."""
         with self._lock:
             self._draw()
             self._send_edit(changes)
+            if self._pending_resize is not None:
+                self._send_resize(*self._pending_resize)
+                self._pending_resize = None
 
     def _send_edit(self, changes: list[dict[str, Any]]) -> None:
         if not changes or self._sock is None:
             return
         payload = (json.dumps({"type": "edit", "changes": changes}) + "\n").encode("utf-8")
+        try:
+            self._sock.sendall(payload)
+        except OSError:
+            pass
+
+    def _send_resize(self, width: int, height: int) -> None:
+        if self._sock is None:
+            return
+        payload = (
+            json.dumps({"type": "resize", "width": width, "height": height}) + "\n"
+        ).encode("utf-8")
         try:
             self._sock.sendall(payload)
         except OSError:
@@ -489,6 +772,7 @@ class CanvasApp:
         """Connect (retrying forever), draw the canvas, and pump user input."""
         raw = self._enter_raw_mode()
         self._enable_mouse()
+        self._install_winch_handler()
         input_thread = threading.Thread(
             target=self._input_loop, name="corvuspixel-input", daemon=True
         )
@@ -508,6 +792,7 @@ class CanvasApp:
                     if sock is None:
                         self._set_connected(False)
                         time.sleep(0.2)
+                        self._pump()
                         continue
                     self._sock = sock
                     self._set_connected(True)
@@ -517,8 +802,11 @@ class CanvasApp:
                         while not self._quit.is_set():
                             try:
                                 line = stream.readline()
+                            except InterruptedError:
+                                continue  # a signal (e.g. SIGWINCH) interrupted the read
                             except socket.timeout:
-                                continue  # idle: re-check the quit flag
+                                self._pump()  # idle: blink + re-centre
+                                continue
                             except OSError:
                                 break
                             if not line:
@@ -531,6 +819,7 @@ class CanvasApp:
                             except json.JSONDecodeError:
                                 continue
                             self._apply(message)
+                            self._pump()
                     except OSError:
                         pass
                     finally:
