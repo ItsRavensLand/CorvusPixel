@@ -88,3 +88,92 @@ def test_smiley_draws_on_default_canvas():
     changes = draw_smiley(c)
     assert len(changes) > 50
     assert c.get(16, 16) == (255, 214, 64)  # face centre is yellow
+
+
+# --------------------------------------------------------------------------- #
+# Session-scoped socket path
+# --------------------------------------------------------------------------- #
+
+
+def test_default_socket_path_is_scoped_by_parent_pid(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.delenv("CORVUSPIXEL_SOCK", raising=False)
+    monkeypatch.setattr(server_mod.os, "getppid", lambda: 4242)
+    assert server_mod.default_socket_path() == "/tmp/corvuspixel-4242.sock"
+
+
+def test_default_socket_path_honours_env_override(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setenv("CORVUSPIXEL_SOCK", "/tmp/custom.sock")
+    assert server_mod.default_socket_path() == "/tmp/custom.sock"
+
+
+# --------------------------------------------------------------------------- #
+# see_canvas: compact view
+# --------------------------------------------------------------------------- #
+
+
+def test_see_canvas_compact_view():
+    from server import compact_view
+
+    c = PixelCanvas(4, 4)
+    for y in range(2):
+        for x in range(2):
+            c.set_pixel(x, y, (255, 0, 0))
+    out = compact_view(c)
+    assert ". = background #000000" in out
+    assert "a = #ff0000" in out
+    grid_lines = out.split("\n")[2:]  # first two lines are header + legend
+    assert grid_lines[0].startswith("aa")  # top-left block is red
+    assert len(out) < 500  # token-cheap
+
+
+def test_see_canvas_downsamples_large_canvas():
+    from server import compact_view
+
+    c = PixelCanvas(64, 64)
+    c.fill_rect(0, 0, 64, 64, (1, 2, 3))
+    out = compact_view(c)
+    grid = out.split("\n")[2:]
+    assert all(len(row) <= 16 for row in grid)  # downsampled to 16 columns
+    assert len(grid) <= 16
+    assert len(out) < 2000
+
+
+# --------------------------------------------------------------------------- #
+# open_canvas: window launcher
+# --------------------------------------------------------------------------- #
+
+
+def test_launch_canvas_window_picks_first_available_terminal(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(server_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+    captured = {}
+
+    class FakeProc:
+        pid = 999
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return FakeProc()
+
+    monkeypatch.setattr(server_mod.subprocess, "Popen", fake_popen)
+    launched = server_mod._launch_canvas_window("/tmp/x.sock")
+    assert launched is not None
+    assert launched.terminal == "x-terminal-emulator"
+    assert launched.pid == 999
+    assert captured["argv"][0] == "/usr/bin/x-terminal-emulator"
+    assert "canvas_app.py" in " ".join(captured["argv"])
+    assert "/tmp/x.sock" in " ".join(captured["argv"])
+
+
+def test_launch_canvas_window_returns_none_without_terminal(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(server_mod.shutil, "which", lambda name: None)
+    assert server_mod._launch_canvas_window("/tmp/x.sock") is None

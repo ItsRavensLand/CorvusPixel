@@ -1,12 +1,15 @@
-"""CorvusPixel — an MCP server that drives a live terminal pixel-art renderer.
+"""CorvusPixel — an MCP server behind an interactive, user-drawn pixel canvas.
 
-The canvas lives in this process. Every tool call mutates the canvas and then
-pushes *only the changed cells* as a JSON message over a Unix domain socket to a
-connected renderer process (:mod:`renderer`), which repaints those cells in a
-truecolor terminal using the ``▀`` half-block character — no files, real time.
+The canvas lives in this process. The *user* draws on it with their mouse and
+keyboard in a separate terminal window (opened via the :func:`open_canvas`
+tool); those edits flow back to this server over a Unix domain socket and are
+rebroadcast to every connected window. Claude Code reads the result cheaply with
+:func:`see_canvas` and only draws (``set_pixel`` & friends) when the user asks.
 
 Transport split: this server speaks MCP over stdio (Claude Code's default) to
-the client, and a separate Unix socket to the renderer process.
+the client, and a separate, session-scoped Unix socket to the canvas windows —
+named after this process's parent PID so each Claude Code session gets its own
+canvas and never collides with a stale instance.
 """
 
 from __future__ import annotations
@@ -16,7 +19,13 @@ import atexit
 import json
 import math
 import os
+import platform
+import shlex
+import shutil
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -30,10 +39,24 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 Color = tuple[int, int, int]
 
-DEFAULT_SOCKET = os.environ.get("CORVUSPIXEL_SOCK", "/tmp/corvuspixel.sock")
+
+def default_socket_path() -> str:
+    """Session-scoped socket path for this MCP server instance.
+
+    The path is named after this process's parent PID — the Claude Code session
+    that spawned us over stdio. A canvas window opened from this session always
+    talks to exactly this server instance, never a stale one from another
+    session. ``CORVUSPIXEL_SOCK`` overrides it for manual runs and tests.
+    """
+    configured = os.environ.get("CORVUSPIXEL_SOCK")
+    if configured:
+        return configured
+    return f"/tmp/corvuspixel-{os.getppid()}.sock"
+
+
 DEFAULT_WIDTH = 32
 DEFAULT_HEIGHT = 32
-DEFAULT_BACKGROUND = "#101028"  # deep navy, so the yellow smiley pops
+DEFAULT_BACKGROUND = "#101028"  # deep navy, so bright pixels pop
 
 
 def parse_hex(color: str) -> Color:
@@ -50,6 +73,73 @@ def parse_hex(color: str) -> Color:
 def hex_str(color: Color) -> str:
     """Render an ``(r, g, b)`` tuple back to a ``#rrggbb`` string."""
     return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+
+def compact_view(canvas: "PixelCanvas", max_grid: int = 16) -> str:
+    """A token-cheap, model-friendly view of the canvas.
+
+    Downsample the canvas to at most ``max_grid`` x ``max_grid`` blocks; each
+    block becomes one symbol by majority vote over its non-background pixels.
+    The legend maps every symbol back to a hex color. The output is a few short
+    lines regardless of canvas size, so the model can read shapes, positions and
+    colors without a raw pixel dump.
+    """
+    background = canvas.background
+    step_x = max(1, math.ceil(canvas.width / max_grid))
+    step_y = max(1, math.ceil(canvas.height / max_grid))
+    grid_w = math.ceil(canvas.width / step_x)
+    grid_h = math.ceil(canvas.height / step_y)
+
+    votes: list[list[dict[Color, int]]] = [
+        [{} for _ in range(grid_w)] for _ in range(grid_h)
+    ]
+    for y in range(canvas.height):
+        for x in range(canvas.width):
+            color = canvas._pixels[y][x]
+            if color == background:
+                continue
+            gy, gx = y // step_y, x // step_x
+            bucket = votes[gy][gx]
+            bucket[color] = bucket.get(color, 0) + 1
+
+    symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    color_to_symbol: dict[Color, str] = {}
+    next_index = 0
+
+    def symbol_for(color: Color) -> str:
+        nonlocal next_index
+        if color in color_to_symbol:
+            return color_to_symbol[color]
+        if next_index >= len(symbols):
+            return "*"
+        symbol = symbols[next_index]
+        next_index += 1
+        color_to_symbol[color] = symbol
+        return symbol
+
+    lines: list[str] = []
+    for gy in range(grid_h):
+        chars: list[str] = []
+        for gx in range(grid_w):
+            bucket = votes[gy][gx]
+            if not bucket:
+                chars.append(".")
+            else:
+                majority = max(bucket, key=bucket.get)
+                chars.append(symbol_for(majority))
+        lines.append("".join(chars))
+
+    legend = ", ".join(
+        [f". = background {hex_str(background)}"]
+        + [f"{sym} = {hex_str(color)}" for color, sym in color_to_symbol.items()]
+    )
+    scale = f"{step_x}x{step_y} block" if (step_x, step_y) != (1, 1) else "1x1"
+    return (
+        f"Canvas {canvas.width}x{canvas.height} shown at {grid_w}x{grid_h} "
+        f"(each symbol = a {scale}). Origin top-left, 0-based.\n"
+        f"Legend: {legend}.\n"
+        + "\n".join(lines)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +163,7 @@ class PixelCanvas:
     """A 2-D grid of RGB pixels plus the drawing primitives the tools need.
 
     Every mutating operation returns the exact set of cells that changed value,
-    so the caller can push a minimal diff to the renderer instead of the whole
+    so the caller can push a minimal diff to the windows instead of the whole
     canvas. ``set_pixel`` errors on out-of-bounds coordinates; ``fill_rect`` and
     ``draw_line`` clip to the canvas edges.
     """
@@ -199,16 +289,19 @@ def draw_smiley(canvas: PixelCanvas) -> list[CellChange]:
 
 
 # --------------------------------------------------------------------------- #
-# Socket sink: pushes diffs to every connected renderer process
+# Socket hub: bidirectional link between the server and the canvas windows
 # --------------------------------------------------------------------------- #
 
 
 class RendererSink:
-    """Accepts renderer connections on a Unix socket and broadcasts messages.
+    """Accepts canvas-window connections, pushes diffs, and ingests user edits.
 
-    Each renderer gets a *full* snapshot when it connects — so a reconnecting
-    renderer can never be out of sync — and every subsequent canvas change is
-    pushed as an incremental ``update`` message carrying only the changed cells.
+    Each connected window gets a *full* snapshot when it connects — so a
+    reconnecting window can never be out of sync — and every subsequent canvas
+    change is pushed as an incremental ``update`` message carrying only the
+    changed cells. The reverse direction is user input: windows send
+    ``{"type": "edit", "changes": [...]}``, which ``on_edit`` delivers to the
+    server to apply and rebroadcast.
     """
 
     def __init__(self, socket_path: str) -> None:
@@ -217,11 +310,22 @@ class RendererSink:
         self._clients_lock = threading.RLock()
         self._stop = threading.Event()
         self._snapshot_provider: Callable[[], dict[str, Any]] | None = None
+        self._on_edit: Callable[[list[CellChange]], None] | None = None
         self._server: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
+        self._reader_threads: set[threading.Thread] = set()
 
-    def start(self, snapshot_provider: Callable[[], dict[str, Any]]) -> None:
+    @property
+    def socket_path(self) -> str:
+        return self._socket_path
+
+    def start(
+        self,
+        snapshot_provider: Callable[[], dict[str, Any]],
+        on_edit: Callable[[list[CellChange]], None] | None = None,
+    ) -> None:
         self._snapshot_provider = snapshot_provider
+        self._on_edit = on_edit
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             os.unlink(self._socket_path)  # clear a stale socket from a dead run
@@ -230,7 +334,7 @@ class RendererSink:
         self._server.bind(self._socket_path)
         self._server.listen(4)
         self._accept_thread = threading.Thread(
-            target=self._accept_loop, name="corvuspixel-renderer-accept", daemon=True
+            target=self._accept_loop, name="corvuspixel-accept", daemon=True
         )
         self._accept_thread.start()
         atexit.register(self.close)
@@ -245,11 +349,57 @@ class RendererSink:
                 continue
             with self._clients_lock:
                 self._clients.add(conn)
+            # Only the new window needs a fresh snapshot — don't re-broadcast a
+            # full redraw to windows that already have current state.
             if self._snapshot_provider is not None:
-                self.push({"type": "full", **self._snapshot_provider()})
+                payload = (
+                    json.dumps({"type": "full", **self._snapshot_provider()}) + "\n"
+                ).encode("utf-8")
+                try:
+                    conn.sendall(payload)
+                except OSError:
+                    pass
+            reader = threading.Thread(
+                target=self._client_read_loop,
+                args=(conn,),
+                name="corvuspixel-read",
+                daemon=True,
+            )
+            with self._clients_lock:
+                self._reader_threads.add(reader)
+            reader.start()
+
+    def _client_read_loop(self, conn: socket.socket) -> None:
+        """Read edits from one canvas window and hand them to the server."""
+        try:
+            stream = conn.makefile("r", encoding="utf-8")
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("type") != "edit" or self._on_edit is None:
+                    continue
+                changes = [
+                    CellChange(c["x"], c["y"], tuple(c["color"]))
+                    for c in message.get("changes", [])
+                ]
+                self._on_edit(changes)
+        except OSError:
+            pass
+        finally:
+            with self._clients_lock:
+                self._clients.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def push(self, message: dict[str, Any]) -> None:
-        """Serialize and broadcast a message to every connected renderer."""
+        """Serialize and broadcast a message to every connected window."""
         payload = (json.dumps(message) + "\n").encode("utf-8")
         with self._clients_lock:
             dead: list[socket.socket] = []
@@ -283,15 +433,16 @@ class RendererSink:
                 except OSError:
                     pass
             self._clients.clear()
+            self._reader_threads.clear()
 
 
 # --------------------------------------------------------------------------- #
-# Canvas + sink wiring, one public method per MCP tool
+# Canvas + socket wiring, one public method per MCP tool
 # --------------------------------------------------------------------------- #
 
 
 class CanvasServer:
-    """Owns the canvas and the renderer socket, and exposes the drawing API."""
+    """Owns the canvas and the window socket, and exposes the drawing API."""
 
     def __init__(
         self,
@@ -305,17 +456,35 @@ class CanvasServer:
         self._sink = RendererSink(socket_path)
 
     def start(self) -> None:
-        """Start accepting renderer connections (call before ``server.run()``)."""
-        self._sink.start(self.snapshot)
+        """Start accepting canvas-window connections (call before ``server.run()``)."""
+        self._sink.start(self.snapshot, on_edit=self._apply_edits)
 
     def close(self) -> None:
         self._sink.close()
+
+    @property
+    def socket_path(self) -> str:
+        """The Unix socket canvas windows connect to (used by ``open_canvas``)."""
+        return self._sink.socket_path
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return self._canvas.snapshot()
 
-    # -- the six tool bodies -------------------------------------------------
+    # -- user input coming back from a canvas window -------------------------
+
+    def _apply_edits(self, changes: list[CellChange]) -> None:
+        """Apply user-drawn edits from a canvas window and rebroadcast them."""
+        with self._lock:
+            applied: list[CellChange] = []
+            for change in changes:
+                try:
+                    applied.extend(self._canvas.set_pixel(change.x, change.y, change.color))
+                except ValueError:
+                    continue  # out-of-bounds from a misbehaving window: ignore
+            self._publish(applied)
+
+    # -- the eight tool bodies ----------------------------------------------
 
     def reset(self, width: int, height: int, background: Color) -> str:
         with self._lock:
@@ -354,6 +523,11 @@ class CanvasServer:
         with self._lock:
             return json.dumps(self._canvas.snapshot())
 
+    def see_canvas(self) -> str:
+        """Return a compact, token-cheap view of the canvas for the model."""
+        with self._lock:
+            return compact_view(self._canvas)
+
     def draw_default(self) -> str:
         """Draw the built-in smiley on the current canvas."""
         with self._lock:
@@ -366,16 +540,82 @@ class CanvasServer:
 
 
 # --------------------------------------------------------------------------- #
+# Window launcher (used by the open_canvas tool)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class LaunchedWindow:
+    """Which terminal we opened the canvas in, and the launcher's PID."""
+
+    terminal: str
+    pid: int | None
+
+
+def _launch_canvas_window(socket_path: str) -> LaunchedWindow | None:
+    """Open a full OS terminal window running the interactive canvas app.
+
+    Tries, in order: Windows Terminal (Windows), Terminal.app (macOS), and on
+    Linux/BSD ``x-terminal-emulator``, ``gnome-terminal``, ``konsole``, then
+    ``xterm``. Returns the first that starts, or ``None`` if none is available.
+    """
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    app = os.path.join(project_dir, "canvas_app.py")
+    python = sys.executable
+    shell_cmd = f'"{python}" "{app}" --socket "{socket_path}"'
+
+    system = platform.system()
+
+    if system == "Windows":
+        wt = shutil.which("wt.exe") or shutil.which("wt")
+        if wt is not None:
+            try:
+                proc = subprocess.Popen([wt, "new-tab", "--", shell_cmd])
+                return LaunchedWindow("Windows Terminal", proc.pid)
+            except OSError:
+                pass
+        return None
+
+    if system == "Darwin":
+        # Terminal.app runs executable .command files in a fresh window.
+        script_path = os.path.join(tempfile.gettempdir(), f"corvuspixel-{os.getpid()}.command")
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write("#!/bin/bash\n")
+                f.write(f"cd {shlex.quote(project_dir)} && exec {shell_cmd}\n")
+            os.chmod(script_path, 0o755)
+            proc = subprocess.Popen(["open", "-a", "Terminal", script_path])
+            return LaunchedWindow("Terminal.app", proc.pid)
+        except OSError:
+            return None
+
+    for terminal in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+        exe = shutil.which(terminal)
+        if exe is None:
+            continue
+        if terminal == "gnome-terminal":
+            argv = [exe, "--", "bash", "-c", shell_cmd]
+        else:
+            argv = [exe, "-e", "bash", "-c", shell_cmd]
+        try:
+            proc = subprocess.Popen(argv, start_new_session=True)
+            return LaunchedWindow(terminal, proc.pid)
+        except OSError:
+            continue
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # MCP server + tools
 # --------------------------------------------------------------------------- #
 
 server = MCPServer(
     "CorvusPixel",
     instructions=(
-        "Live pixel-art canvas. Coordinates are 0-based with the origin at the "
-        "top-left; x grows right, y grows down. Colors are '#rrggbb' hex strings. "
-        "Every change is drawn immediately in the CorvusPixel terminal pane. "
-        "The canvas starts at 32x32 with a smiley already drawn on it."
+        "Interactive pixel-art canvas. The user draws in a terminal window opened "
+        "with open_canvas(); read what they drew with see_canvas(). Coordinates "
+        "are 0-based with the origin top-left; colors are '#rrggbb'. Only draw "
+        "(set_pixel/fill_rect/draw_line/clear/init_canvas) when the user asks."
     ),
 )
 
@@ -464,6 +704,41 @@ def get_canvas() -> str:
     return _server().get_canvas()
 
 
+@server.tool()
+def see_canvas() -> str:
+    """Read the current canvas as a compact symbol grid — cheap for the model.
+
+    Returns a downsampled text grid (each symbol = one color block) with a
+    legend. Use this to see what the user drew; it is far cheaper in tokens than
+    a raw pixel dump. Does not modify the canvas.
+    """
+    return _server().see_canvas()
+
+
+@server.tool()
+def open_canvas() -> str:
+    """Open a terminal window running the interactive canvas app.
+
+    The window connects to this session's canvas socket. Draw with the mouse
+    (click / click-drag) or keyboard (arrow keys move the cursor, space paints,
+    x erases, c cycles the palette, 1-8 pick a color, q quits). Changes appear
+    here instantly; read them back with see_canvas(). Fails if no compatible
+    terminal is found.
+    """
+    state = _server()
+    launched = _launch_canvas_window(state.socket_path)
+    if launched is None:
+        raise ToolError(
+            "no compatible terminal found — install gnome-terminal, konsole or xterm"
+        )
+    pid = f" (launcher pid {launched.pid})" if launched.pid else ""
+    return (
+        f"Opened the canvas in a new {launched.terminal}{pid}. "
+        "Mouse: click/drag to paint. Keys: arrows move, space paint/toggle, "
+        "x erase, c next color, 1-8 palette, q quit."
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -474,7 +749,9 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--socket", default=DEFAULT_SOCKET, help="Unix socket the renderer connects to"
+        "--socket",
+        default=default_socket_path(),
+        help="Unix socket canvas windows connect to (default: session-scoped path)",
     )
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)

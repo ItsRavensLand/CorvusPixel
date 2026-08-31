@@ -1,29 +1,25 @@
 #!/usr/bin/env bash
-# CorvusPixel setup: install dependencies, register the MCP server with Claude
-# Code, and open a two-pane tmux session:
-#
-#   left pane  -> Claude Code
-#   right pane -> live renderer (renderer.py)
-#
+# CorvusPixel setup: install dependencies and register the MCP server with Claude
+# Code. The canvas window itself is opened by asking Claude Code to call the
+# open_canvas tool — no tmux required.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SESSION="corvuspixel"
 PYTHON="${PYTHON:-python3}"
 
-echo "==> 1/4  Python venv + dependencies (mcp, rich)"
+echo "==> 1/3  Python venv + dependencies (mcp, rich)"
 if [ ! -d "$PROJECT_DIR/.venv" ]; then
     "$PYTHON" -m venv "$PROJECT_DIR/.venv"
 fi
 "$PROJECT_DIR/.venv/bin/pip" install --quiet --upgrade pip
 "$PROJECT_DIR/.venv/bin/pip" install --quiet "mcp>=2,<3" "rich>=13"
 
-echo "==> 2/4  Git repository"
+echo "==> 2/3  Git repository"
 if [ ! -d "$PROJECT_DIR/.git" ]; then
     git -C "$PROJECT_DIR" init
 fi
 
-echo "==> 3/4  Register MCP server with Claude Code (project scope)"
+echo "==> 3/3  Register MCP server with Claude Code (project scope)"
 if command -v claude >/dev/null 2>&1; then
     claude mcp add --scope project corvuspixel -- \
         "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/server.py"
@@ -33,21 +29,13 @@ else
     echo "   claude mcp add --scope project corvuspixel -- $PROJECT_DIR/.venv/bin/python $PROJECT_DIR/server.py"
 fi
 
-echo "==> 4/4  Open the two-pane tmux session"
-if ! command -v tmux >/dev/null 2>&1; then
-    echo "!! 'tmux' not found — start the two pieces manually:"
-    echo "   left pane :  claude"
-    echo "   right pane:  $PROJECT_DIR/.venv/bin/python $PROJECT_DIR/renderer.py"
-    exit 0
-fi
+cat <<'EOF'
 
-tmux kill-session -t "$SESSION" 2>/dev/null || true
-tmux new-session -d -s "$SESSION" -x 220 -y 50 -n pixel -c "$PROJECT_DIR"
-tmux split-window -h -t "$SESSION:pixel" -c "$PROJECT_DIR"
+CorvusPixel is ready. In Claude Code, call the open_canvas tool to open the
+interactive canvas window. Draw with your mouse/keyboard, read it back with
+see_canvas, and ask Claude to draw only when you want it to.
 
-# Right pane first so it is already retrying to connect while Claude boots.
-tmux send-keys -t "$SESSION:pixel.1" ".venv/bin/python renderer.py" Enter
-tmux send-keys -t "$SESSION:pixel.0" "claude" Enter
-
-tmux select-pane -t "$SESSION:pixel.0"
-tmux attach-session -t "$SESSION"
+Manual run (optional, if you skip MCP registration):
+  terminal 1:  <project>/.venv/bin/python <project>/server.py
+  terminal 2:  <project>/.venv/bin/python <project>/canvas_app.py --socket <server socket>
+EOF

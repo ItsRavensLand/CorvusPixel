@@ -14,13 +14,13 @@ from pathlib import Path
 from rich.console import Console
 
 from server import CanvasServer
-from renderer import PixelRenderer
+from canvas_app import CanvasApp
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 
 class FakeRenderer:
-    """Mimics renderer.py: connects to the server socket and collects messages."""
+    """Mimics canvas_app.py: connects to the server socket and collects messages."""
 
     def __init__(self, socket_path: str) -> None:
         self._socket_path = socket_path
@@ -104,6 +104,59 @@ def test_sink_protocol_direct() -> None:
             fake.close()
 
 
+def test_server_applies_user_edits_and_broadcasts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "edits.sock")
+        cs = CanvasServer(sock_path, width=8, height=8, background=(0, 0, 0))
+        cs.start()
+        fake = FakeRenderer(sock_path)
+        try:
+            fake.connect()
+            fake.read_message()  # the initial full snapshot
+
+            # The interactive app is another client: connect and send an edit.
+            app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            app.connect(sock_path)
+            app.sendall(
+                (
+                    json.dumps(
+                        {
+                            "type": "edit",
+                            "changes": [{"x": 4, "y": 5, "color": [255, 0, 0]}],
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+
+            # The edit is rebroadcast to the other client as an update.
+            msg = fake.read_message()
+            assert msg["type"] == "update"
+            assert msg["changes"] == [{"x": 4, "y": 5, "color": [255, 0, 0]}]
+
+            # The shared canvas reflects the user's edit.
+            assert json.loads(cs.get_canvas())["pixels"][5][4] == [255, 0, 0]
+            app.close()
+        finally:
+            cs.close()
+            fake.close()
+
+
+def test_see_canvas_reflects_user_edits() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "see.sock")
+        cs = CanvasServer(sock_path, width=4, height=4, background=(0, 0, 0))
+        cs.start()
+        try:
+            cs.set_pixel(0, 0, "#ff0000")
+            out = cs.see_canvas()
+            assert "a = #ff0000" in out
+            assert "background #000000" in out
+            assert out.split("\n")[2].startswith("a")  # top-left block is red
+        finally:
+            cs.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. Renderer: applies messages and draws only the cells that changed
 # --------------------------------------------------------------------------- #
@@ -115,7 +168,7 @@ def test_renderer_draws_initial_full_state() -> None:
         file=out, force_terminal=True, color_system="truecolor",
         width=80, height=40, force_interactive=True, legacy_windows=False,
     )
-    r = PixelRenderer("/tmp/nonexistent.sock", background=(0, 0, 0), console=console)
+    r = CanvasApp("/tmp/nonexistent.sock", background=(0, 0, 0), console=console)
     r._apply({
         "type": "full",
         "width": 4,
@@ -128,7 +181,7 @@ def test_renderer_draws_initial_full_state() -> None:
     })
     rendered = out.getvalue()
     assert "CorvusPixel" in rendered  # header
-    assert rendered.count("▀") == 4  # 4 cells, one per column
+    assert rendered.count("▀") == 5  # 4 cells + 1 reverse-video cursor overlay
     assert "\x1b[38;2;255;0;0m" in rendered  # top pixel = red foreground
     assert "\x1b[48;2;0;0;0m" in rendered  # bottom pixel = black background
 
@@ -139,7 +192,7 @@ def test_renderer_rewrites_only_changed_cell() -> None:
         file=out, force_terminal=True, color_system="truecolor",
         width=80, height=40, force_interactive=True, legacy_windows=False,
     )
-    r = PixelRenderer("/tmp/nonexistent.sock", background=(0, 0, 0), console=console)
+    r = CanvasApp("/tmp/nonexistent.sock", background=(0, 0, 0), console=console)
     full = {
         "type": "full",
         "width": 4,
@@ -198,6 +251,8 @@ async def _run_e2e() -> None:
                         "draw_line",
                         "clear",
                         "get_canvas",
+                        "see_canvas",
+                        "open_canvas",
                     ]
 
                     # the fake renderer connects while the server is up: full snapshot
