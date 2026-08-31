@@ -10,8 +10,11 @@ draw:
   canvas (columns at the right edge, rows at the bottom edge); ``c`` cycles the
   palette; ``1``-``8`` pick a palette color; ``Tab`` opens the visual palette
   (arrow keys + Enter/space select); ``q`` or Ctrl+C quits.
-- **Mouse**: click (or click-drag) paints with the current brush via SGR
-  mouse-mode reporting; clicking a palette swatch selects that color.
+- **Mouse**: a clickable toolbar above the canvas — buttons for paint, eraser,
+  brush size, palette, column/row resize and quit, plus a Paint-style brush-size
+  bar (click it, or drag the ``●`` handle, to size the brush). Clicking (or
+  click-dragging) on the canvas paints with the current brush; clicking a
+  palette swatch selects that color.
 - **Layout**: the canvas is centered in the terminal (horizontally and
   vertically) and re-centered when the terminal is resized (SIGWINCH). The
   cursor is a blinking reverse-video block that always sits at the current
@@ -33,7 +36,10 @@ requirement here, and it is simplest with our own ANSI cell-diff on top of
 rich's ``Live`` lifecycle context. Terminal input (arrow keys, SGR mouse) arrives
 as byte sequences on stdin, which we parse directly; pulling in a full widget
 framework (textual) would add a large dependency without helping the diff-only
-renderer.
+renderer. The toolbar buttons and the brush bar are custom clickable regions hit-
+tested over the same SGR mouse reports the canvas uses — a small button/slider
+model (``ToolButton`` / ``BrushSlider``) with an ``on_click``-style action
+dispatch, so UI controls and mouse drawing share one input path.
 """
 
 from __future__ import annotations
@@ -89,6 +95,64 @@ PALETTE: list[tuple[str, Color]] = [
     ("cyan", (0, 255, 255)),
     ("blue", (0, 0, 255)),
     ("pink", (255, 120, 150)),
+]
+
+
+class ToolButton:
+    """A clickable toolbar button: a labelled region with an on-click action."""
+
+    __slots__ = ("ident", "label", "action", "row", "col", "width")
+
+    def __init__(self, ident: str, label: str, action: str, row: int, col: int) -> None:
+        self.ident = ident
+        self.label = label
+        self.action = action  # name of a CanvasApp method to call on click
+        self.row = row
+        self.col = col
+        self.width = len(label)
+
+    def contains(self, col: int, row: int) -> bool:
+        return row == self.row and self.col <= col < self.col + self.width
+
+
+class BrushSlider:
+    """A Paint-style brush-size bar: a track with a handle showing the size.
+
+    Clicking the track (or dragging the handle) sets the brush size; the track
+    plus one column of margin on each side is the clickable zone, so dragging
+    past either end clamps to the min/max instead of dropping the drag.
+    """
+
+    __slots__ = ("row", "col", "width")
+
+    def __init__(self, row: int, col: int) -> None:
+        self.row = row
+        self.col = col
+        self.width = BRUSH_MAX  # one track cell per brush size
+
+    def contains(self, col: int, row: int) -> bool:
+        return row == self.row and (self.col - 1) <= col < (self.col + self.width + 1)
+
+    def brush_size_for(self, col: int) -> int:
+        pos = min(max(col, self.col), self.col + self.width - 1)
+        return max(BRUSH_MIN, min(BRUSH_MAX, pos - self.col + 1))
+
+
+# The toolbar is a single row of clickable buttons declared in one place, so the
+# renderer and the mouse hit-testing both come from the same spec. ``action`` is
+# the name of a CanvasApp method to invoke on click; the slider is special.
+_TOOLBAR_SPEC: list[tuple[str, str, str]] = [
+    ("paint", "[Paint]", "_tool_paint"),
+    ("eraser", "[Eraser]", "_tool_eraser"),
+    ("brush_dec", "[-]", "_tool_brush_dec"),
+    ("brush_slider", "", "brush_slider"),
+    ("brush_inc", "[+]", "_tool_brush_inc"),
+    ("palette", "[Palette]", "_tool_palette"),
+    ("col_dec", "[W-]", "_tool_col_dec"),
+    ("col_inc", "[W+]", "_tool_col_inc"),
+    ("row_dec", "[H-]", "_tool_row_dec"),
+    ("row_inc", "[H+]", "_tool_row_inc"),
+    ("quit", "[Quit]", "_tool_quit"),
 ]
 
 
@@ -159,6 +223,8 @@ class CanvasApp:
         self._old_cells: list[list[Cell]] = []
         self._old_header = ""
         self._old_status = ""
+        self._old_toolbar = ""
+        self._pending_chrome = False  # next input only touches the chrome, not canvas
         self._old_palette_key: tuple[Any, ...] | None = None
         self._old_cursor_cell: tuple[int, int] | None = None
         self._cursor_was_reversed = False
@@ -177,8 +243,8 @@ class CanvasApp:
         """Where everything sits: centering offsets for the current terminal."""
         tw, th = self._query_size()
         canvas_rows = max(1, (self._height + 1) // 2)  # ceil(height / 2)
-        # header + canvas + palette (indicator + swatches) + status
-        content_h = 1 + canvas_rows + 2 + 1
+        # header + toolbar + canvas + palette (indicator + swatches) + status
+        content_h = 1 + 1 + canvas_rows + 2 + 1
         top_pad = max(0, (th - content_h) // 2)
         left_pad = max(0, (tw - max(1, self._width) * CELL_W) // 2)
         return {
@@ -295,6 +361,7 @@ class CanvasApp:
 
     def _render_status(self) -> str:
         return (
+            "mouse: toolbar · brush bar · swatches · canvas — "
             "keys: arrows move · space paint/toggle · x erase · e eraser · "
             "+/- brush · [ ] cols · { } rows · tab palette · q quit"
         )
@@ -310,8 +377,8 @@ class CanvasApp:
             "indent": indent,
             "swatch_w": swatch_w,
             "gap": gap,
-            "indicator_row": layout["top_pad"] + 2 + layout["canvas_rows"],
-            "row": layout["top_pad"] + 3 + layout["canvas_rows"],
+            "indicator_row": layout["top_pad"] + 3 + layout["canvas_rows"],
+            "row": layout["top_pad"] + 4 + layout["canvas_rows"],
         }
 
     def _render_palette_rows(self, layout: dict[str, int], geom: dict[str, int]) -> None:
@@ -336,6 +403,44 @@ class CanvasApp:
             file.write(CELL_CH * (geom["swatch_w"] // CELL_W))
             file.write(RESET)
 
+    def _toolbar_geometry(
+        self, layout: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        """Row/columns of the toolbar: the button list, the brush bar, the row."""
+        layout = layout or self._compute_layout()
+        total = -1  # every item is followed by a 1-column gap; drop the last one
+        for ident, label, _action in _TOOLBAR_SPEC:
+            total += (BRUSH_MAX if ident == "brush_slider" else len(label)) + 1
+        indent = max(0, (layout["term_w"] - total) // 2)
+        row = layout["top_pad"] + 2  # just below the header
+        col = indent + 1
+        buttons: list[ToolButton] = []
+        slider: BrushSlider | None = None
+        for ident, label, action in _TOOLBAR_SPEC:
+            if ident == "brush_slider":
+                slider = BrushSlider(row, col)
+            else:
+                buttons.append(ToolButton(ident, label, action, row, col))
+            col += (BRUSH_MAX if ident == "brush_slider" else len(label)) + 1
+        return {"row": row, "indent": indent, "buttons": buttons, "slider": slider}
+
+    def _render_toolbar(self) -> str:
+        """ANSI string for the toolbar row (buttons + the brush-size bar)."""
+        geom = self._toolbar_geometry()
+        parts: list[str] = []
+        for button in geom["buttons"]:
+            label = button.label
+            if button.ident == "eraser" and self._eraser:
+                label = f"\x1b[7m{label}{RESET}"  # active tool shows reversed
+            parts.append(f"\x1b[{button.row};{button.col}H{label}")
+        slider = geom["slider"]
+        if slider is not None:
+            handle = f"\x1b[7m●{RESET}"
+            track = "─" * (self._brush_size - 1) + handle
+            track += "─" * (BRUSH_MAX - self._brush_size)
+            parts.append(f"\x1b[{slider.row};{slider.col}H{track}")
+        return "".join(parts)
+
     def _draw(self) -> None:
         """Repaint only what changed. A layout change forces a full redraw."""
         with self._lock:
@@ -353,6 +458,7 @@ class CanvasApp:
         self._old_cells = []
         self._old_header = ""
         self._old_status = ""
+        self._old_toolbar = ""
         self._old_palette_key = None
         self._old_cursor_cell = None
         self._cursor_was_reversed = False
@@ -370,6 +476,13 @@ class CanvasApp:
             file.write(RESET)
             self._old_header = header
 
+        toolbar = self._render_toolbar()
+        if toolbar != self._old_toolbar:
+            file.write(f"\x1b[{layout['top_pad'] + 2};1H\x1b[2K")
+            file.write(toolbar)
+            file.write(RESET)
+            self._old_toolbar = toolbar
+
         old = self._old_cells
         for y in range(max(len(old), len(rows))):
             new_row = rows[y] if y < len(rows) else None
@@ -378,11 +491,11 @@ class CanvasApp:
                 continue
             if new_row is None:
                 # A row disappeared (canvas shrank): erase it.
-                file.write(f"\x1b[{layout['top_pad'] + 2 + y};1H\x1b[2K")
+                file.write(f"\x1b[{layout['top_pad'] + 3 + y};1H\x1b[2K")
                 continue
             if old_row is None or len(new_row) != len(old_row):
                 # A brand-new or resized row: erase it and write every cell.
-                file.write(f"\x1b[{layout['top_pad'] + 2 + y};1H\x1b[2K")
+                file.write(f"\x1b[{layout['top_pad'] + 3 + y};1H\x1b[2K")
                 for x, cell in enumerate(new_row):
                     self._write_cell(file, y, x, cell)
             else:
@@ -395,6 +508,35 @@ class CanvasApp:
         # Cursor overlay: a blinking reverse-video block at the cursor pixel.
         # When it moves, restore the old cell; when the blink phase flips,
         # redraw the cursor cell so it always tracks with no leftovers.
+        self._render_cursor(rows)
+
+        geom = self._palette_geometry(layout)
+        palette_key = (
+            self._palette_idx,
+            geom["indicator_row"],
+            geom["row"],
+            geom["indent"],
+            geom["swatch_w"],
+            geom["gap"],
+        )
+        if palette_key != self._old_palette_key:
+            self._old_palette_key = palette_key
+            self._render_palette_rows(layout, geom)
+
+        status = self._render_status()
+        if status != self._old_status:
+            file.write(f"\x1b[{layout['top_pad'] + 5 + layout['canvas_rows']};1H\x1b[2K")
+            file.write(status)
+            file.write(RESET)
+            self._old_status = status
+
+        # Park the terminal cursor below everything so it never wanders.
+        file.write(f"\x1b[{layout['top_pad'] + 6 + layout['canvas_rows']};1H")
+        file.flush()
+
+    def _render_cursor(self, rows: list[list[Cell]]) -> None:
+        """Draw the blinking cursor over its cell; restore the old cell on move."""
+        file = self._console.file
         new_cursor = self._cursor_cell()
         blink = self._blink_active
         if new_cursor != self._old_cursor_cell:
@@ -414,34 +556,60 @@ class CanvasApp:
                 self._write_cell(file, cy, cx, rows[cy][cx], reverse=blink)
             self._cursor_was_reversed = blink
 
-        geom = self._palette_geometry(layout)
-        palette_key = (
-            self._palette_idx,
-            geom["indicator_row"],
-            geom["row"],
-            geom["indent"],
-            geom["swatch_w"],
-            geom["gap"],
-        )
-        if palette_key != self._old_palette_key:
-            self._old_palette_key = palette_key
-            self._render_palette_rows(layout, geom)
+    def _redraw_chrome(self) -> None:
+        """Redraw only the non-canvas parts: header, cursor, toolbar, palette,
+        status. Used for input that changes nothing on the pixel grid (brush
+        size, tool toggles, palette selection), so e.g. dragging the brush bar
+        never causes a canvas redraw."""
+        with self._lock:
+            file = self._console.file
+            layout = self._layout()
+            rows = self._display_rows()
 
-        status = self._render_status()
-        if status != self._old_status:
-            file.write(f"\x1b[{layout['top_pad'] + 4 + layout['canvas_rows']};1H\x1b[2K")
-            file.write(status)
-            file.write(RESET)
-            self._old_status = status
+            header = self._render_header()
+            if header != self._old_header:
+                file.write(f"\x1b[{layout['top_pad'] + 1};1H\x1b[2K")
+                file.write(header)
+                file.write(RESET)
+                self._old_header = header
 
-        # Park the terminal cursor below everything so it never wanders.
-        file.write(f"\x1b[{layout['top_pad'] + 5 + layout['canvas_rows']};1H")
-        file.flush()
+            self._render_cursor(rows)
+
+            geom = self._palette_geometry(layout)
+            palette_key = (
+                self._palette_idx,
+                geom["indicator_row"],
+                geom["row"],
+                geom["indent"],
+                geom["swatch_w"],
+                geom["gap"],
+            )
+            if palette_key != self._old_palette_key:
+                self._old_palette_key = palette_key
+                self._render_palette_rows(layout, geom)
+
+            toolbar = self._render_toolbar()
+            if toolbar != self._old_toolbar:
+                file.write(f"\x1b[{layout['top_pad'] + 2};1H\x1b[2K")
+                file.write(toolbar)
+                file.write(RESET)
+                self._old_toolbar = toolbar
+
+            status = self._render_status()
+            if status != self._old_status:
+                file.write(f"\x1b[{layout['top_pad'] + 5 + layout['canvas_rows']};1H\x1b[2K")
+                file.write(status)
+                file.write(RESET)
+                self._old_status = status
+
+            # Park the terminal cursor below everything so it never wanders.
+            file.write(f"\x1b[{layout['top_pad'] + 6 + layout['canvas_rows']};1H")
+            file.flush()
 
     def _write_cell(self, file: Any, y: int, x: int, cell: Cell, reverse: bool = False) -> None:
         """Move to a cell and draw it: fg = top pixel, bg = bottom pixel."""
         layout = self._layout()
-        row = layout["top_pad"] + 2 + y  # row 1 is the header
+        row = layout["top_pad"] + 3 + y  # row 1 header, row 2 toolbar
         col = layout["left_pad"] + x * CELL_W + 1
         (fr, fg, fb), (br, bg, bb) = cell
         file.write(f"\x1b[{row};{col}H")
@@ -496,10 +664,12 @@ class CanvasApp:
     def _cycle_color(self) -> None:
         self._palette_idx = (self._palette_idx + 1) % len(PALETTE)
         self._color = PALETTE[self._palette_idx][1]
+        self._pending_chrome = True
 
     def _select_color(self, index: int) -> None:
         self._palette_idx = index % len(PALETTE)
         self._color = PALETTE[self._palette_idx][1]
+        self._pending_chrome = True
 
     def _toggle_paint(self) -> list[dict[str, Any]]:
         """Paint the brush at the cursor; if already that colour, erase it."""
@@ -534,13 +704,59 @@ class CanvasApp:
         self._pending_resize = (w, h)
         return []
 
+    # -- toolbar actions (same effect as the matching keyboard shortcut) ----
+
+    def _set_brush_size(self, size: int) -> list[dict[str, Any]]:
+        """Clamp and apply a brush size. Only chrome changes — never the canvas."""
+        new = max(BRUSH_MIN, min(BRUSH_MAX, size))
+        if new == self._brush_size:
+            return []  # unchanged: nothing to redraw (throttles slider drags)
+        self._brush_size = new
+        self._pending_chrome = True
+        return []
+
+    def _tool_paint(self) -> list[dict[str, Any]]:
+        return self._toggle_paint()
+
+    def _tool_eraser(self) -> list[dict[str, Any]]:
+        self._eraser = not self._eraser
+        self._pending_chrome = True
+        return []
+
+    def _tool_brush_dec(self) -> list[dict[str, Any]]:
+        return self._set_brush_size(self._brush_size - 1)
+
+    def _tool_brush_inc(self) -> list[dict[str, Any]]:
+        return self._set_brush_size(self._brush_size + 1)
+
+    def _tool_palette(self) -> list[dict[str, Any]]:
+        self._palette_mode = True
+        self._pending_chrome = True
+        return []
+
+    def _tool_col_dec(self) -> list[dict[str, Any]]:
+        return self._request_resize(-1, 0)
+
+    def _tool_col_inc(self) -> list[dict[str, Any]]:
+        return self._request_resize(1, 0)
+
+    def _tool_row_dec(self) -> list[dict[str, Any]]:
+        return self._request_resize(0, -1)
+
+    def _tool_row_inc(self) -> list[dict[str, Any]]:
+        return self._request_resize(0, 1)
+
+    def _tool_quit(self) -> list[dict[str, Any]]:
+        self._quit.set()
+        return []
+
     def _screen_cell(self, col: int, row: int) -> tuple[int, int] | None:
         """Map a terminal (1-based) col/row to a canvas cell, or None."""
         layout = self._compute_layout()
-        rel = row - 1 - layout["top_pad"]  # 0-based; 0 = header row
-        if rel < 1:
+        rel = row - 1 - layout["top_pad"]  # 0-based; 0 = header, 1 = toolbar
+        if rel < 2:
             return None
-        dy = rel - 1
+        dy = rel - 2
         if dy < 0 or dy >= layout["canvas_rows"]:
             return None  # below the canvas (palette / status rows)
         x = (col - 1 - layout["left_pad"]) // CELL_W
@@ -561,12 +777,33 @@ class CanvasApp:
     def _handle_mouse(
         self, button: int, col: int, row: int, pressed: bool
     ) -> list[dict[str, Any]]:
-        """SGR mouse event: paint the clicked cell with the brush (or pick a
-        palette swatch). A click always fills both halves of the cell."""
+        """SGR mouse event: toolbar button / brush bar, palette swatch, or paint.
+
+        A click on the canvas fills both halves of the cell under the cursor
+        with the brush. Toolbar and swatch clicks act like the matching
+        keyboard shortcut (and leave palette mode, mirroring keyboard behaviour).
+        """
         if not pressed or button not in (0, 32):
             return []
+        geom = self._toolbar_geometry()
+        if row == geom["row"]:
+            slider = geom["slider"]
+            if slider is not None and slider.contains(col, row):
+                if self._palette_mode:
+                    self._palette_mode = False
+                    self._pending_chrome = True
+                return self._set_brush_size(slider.brush_size_for(col))
+            for b in geom["buttons"]:
+                if b.contains(col, row):
+                    if self._palette_mode:
+                        self._palette_mode = False
+                        self._pending_chrome = True
+                    return getattr(self, b.action)()
+            return []  # toolbar spacing: nothing to do
         idx = self._palette_hit(col, row)
         if idx is not None:
+            if self._palette_mode:
+                self._palette_mode = False
             self._select_color(idx)
             return []
         hit = self._screen_cell(col, row)
@@ -590,25 +827,27 @@ class CanvasApp:
             return []
         if ch == "\t":
             self._palette_mode = not self._palette_mode
+            self._pending_chrome = True
             return []
         if self._palette_mode:
             if ch in ("\r", "\n", " "):
                 self._palette_mode = False  # confirm the highlighted swatch
+                self._pending_chrome = True
                 return []
             self._palette_mode = False  # any other key leaves palette mode
+            self._pending_chrome = True
         if ch == " ":
             return self._toggle_paint()
         if ch == "x":
             return self._erase()
         if ch == "e":
             self._eraser = not self._eraser
+            self._pending_chrome = True
             return []
         if ch in "+=":
-            self._brush_size = min(self._brush_size + 1, BRUSH_MAX)
-            return []
+            return self._set_brush_size(self._brush_size + 1)
         if ch in "-_":
-            self._brush_size = max(self._brush_size - 1, BRUSH_MIN)
-            return []
+            return self._set_brush_size(self._brush_size - 1)
         if ch == "[":
             return self._request_resize(-1, 0)
         if ch == "]":
@@ -699,7 +938,14 @@ class CanvasApp:
     def _after_edit(self, changes: list[dict[str, Any]]) -> None:
         """Redraw and sync any edits/resizes to the server."""
         with self._lock:
-            self._draw()
+            chrome = self._pending_chrome
+            self._pending_chrome = False
+            if chrome and not changes and self._pending_resize is None and not self._force_full:
+                # Brush/tool/palette-only input: redraw just the chrome, never
+                # the canvas cells (e.g. every drag step of the brush bar).
+                self._redraw_chrome()
+            else:
+                self._draw()
             self._send_edit(changes)
             if self._pending_resize is not None:
                 self._send_resize(*self._pending_resize)

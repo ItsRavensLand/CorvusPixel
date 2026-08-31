@@ -15,11 +15,13 @@ from rich.console import Console
 
 from canvas_app import (
     BRUSH_MAX,
+    BRUSH_MIN,
     CELL_W,
     MAX_CANVAS,
     MIN_CANVAS,
     PALETTE,
     CanvasApp,
+    ToolButton,
 )
 
 FULL = {
@@ -31,10 +33,11 @@ FULL = {
 }
 
 # With a 4x4 canvas in an 80x40 terminal:
-#   canvas_rows = 2, content height = 1 + 2 + 2 + 1 = 6
-#   top_pad = (40-6)//2 = 17, left_pad = (80 - 4*2)//2 = 36
+#   canvas_rows = 2, content height = header + toolbar + canvas + palette + status
+#   = 1 + 1 + 2 + 2 + 1 = 7
+#   top_pad = (40-7)//2 = 16, left_pad = (80 - 4*2)//2 = 36
 SIZE = (80, 40)
-CONTENT_H = 6
+CONTENT_H = 7
 
 
 def make_app(size=SIZE) -> CanvasApp:
@@ -55,13 +58,34 @@ def make_app(size=SIZE) -> CanvasApp:
 def cell_screen(app: CanvasApp, x: int, dy: int) -> tuple[int, int]:
     """Terminal (1-based col, row) of the top-left of a canvas display cell."""
     l = app._layout_info
-    return (l["left_pad"] + x * CELL_W + 1, l["top_pad"] + 2 + dy)
+    return (l["left_pad"] + x * CELL_W + 1, l["top_pad"] + 3 + dy)
 
 
 def palette_swatch_screen(app: CanvasApp, idx: int) -> tuple[int, int]:
     """Terminal (1-based col, row) of a palette swatch."""
     g = app._palette_geometry()
     return (g["indent"] + idx * (g["swatch_w"] + g["gap"]) + 1, g["row"])
+
+
+def toolbar_button(app: CanvasApp, ident: str) -> ToolButton:
+    """The toolbar ``ToolButton`` with the given ident."""
+    for b in app._toolbar_geometry()["buttons"]:
+        if b.ident == ident:
+            return b
+    raise AssertionError(f"no toolbar button {ident!r}")
+
+
+def click_toolbar(app: CanvasApp, ident: str):
+    """Dispatch a mouse click on the toolbar button ``ident``."""
+    b = toolbar_button(app, ident)
+    return app._handle_csi(f"<0;{b.col};{b.row}", "M")
+
+
+def slider_slot(app: CanvasApp, size: int) -> tuple[int, int]:
+    """Terminal (col, row) of the brush-bar track cell for a brush size."""
+    s = app._toolbar_geometry()["slider"]
+    assert s is not None
+    return (s.col + (size - 1), s.row)
 
 
 # --------------------------------------------------------------------------- #
@@ -307,7 +331,7 @@ def test_cursor_renders_at_position_and_tracks():
     out = app._console.file
     first = out.getvalue()
     l = app._layout_info
-    pos_cell = lambda x: f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + x * CELL_W + 1}H"
+    pos_cell = lambda x: f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + x * CELL_W + 1}H"
 
     # move to (1,0): old cell (0,0) restored plain, new cell (1,0) reversed
     app._cursor_x, app._cursor_y = 1, 0
@@ -354,7 +378,7 @@ def test_square_pixel_two_columns():
     app._apply({"type": "update", "changes": [{"x": 0, "y": 0, "color": [255, 0, 0]}]})
     delta = out.getvalue()[first:]
     l = app._layout_info
-    assert f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + 1}H" in delta
+    assert f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H" in delta
     assert delta.count("▀") == 2  # exactly one cell = two half-block columns
     assert "▀▀" in delta
 
@@ -369,7 +393,7 @@ def test_canvas_centering_at_terminal_sizes():
         app = make_app(size=size)
         out = app._console.file
         l = app._layout_info
-        assert l["content_h"] == CONTENT_H  # header + 2 canvas rows + palette + status
+        assert l["content_h"] == CONTENT_H  # header + toolbar + canvas + palette + status
         assert l["top_pad"] == max(0, (size[1] - CONTENT_H) // 2)
         assert l["left_pad"] == max(0, (size[0] - 4 * CELL_W) // 2)
         assert f"\x1b[{l['top_pad'] + 1};1H" in out.getvalue()  # header is centered
@@ -423,3 +447,204 @@ def test_resize_pending_is_sent_and_cleared():
     assert app._pending_resize == (5, 4)
     app._after_edit([])  # no socket in tests -> send is a no-op, flag still clears
     assert app._pending_resize is None
+
+
+# --------------------------------------------------------------------------- #
+# Clickable toolbar: one button per tool, acting like the keyboard shortcut
+# --------------------------------------------------------------------------- #
+
+
+def test_toolbar_paint_button_paints_at_cursor():
+    app = make_app()
+    app._color = (255, 0, 0)
+    changes = click_toolbar(app, "paint")
+    assert changes == [{"x": 0, "y": 0, "color": [255, 0, 0]}]
+    assert app._pixels[0][0] == (255, 0, 0)
+
+
+def test_toolbar_eraser_button_toggles():
+    app = make_app()
+    assert app._eraser is False
+    click_toolbar(app, "eraser")
+    assert app._eraser is True
+    click_toolbar(app, "eraser")
+    assert app._eraser is False
+
+
+def test_toolbar_brush_buttons_step_and_clamp():
+    app = make_app()
+    click_toolbar(app, "brush_inc")
+    assert app._brush_size == 2
+    click_toolbar(app, "brush_dec")
+    assert app._brush_size == 1
+    click_toolbar(app, "brush_dec")  # clamps at the minimum
+    assert app._brush_size == BRUSH_MIN
+    app._brush_size = BRUSH_MAX
+    click_toolbar(app, "brush_inc")  # clamps at the maximum
+    assert app._brush_size == BRUSH_MAX
+
+
+def test_toolbar_palette_button_opens_palette_mode():
+    app = make_app()
+    click_toolbar(app, "palette")
+    assert app._palette_mode is True
+
+
+def test_toolbar_resize_buttons():
+    app = make_app()
+    click_toolbar(app, "col_inc")
+    assert app._width == 5
+    assert app._pending_resize == (5, 4)
+    click_toolbar(app, "row_inc")
+    assert app._height == 5
+    assert app._pending_resize == (5, 5)
+    click_toolbar(app, "col_dec")
+    assert app._width == 4
+    click_toolbar(app, "row_dec")
+    assert app._height == 4
+
+
+def test_toolbar_quit_button_sets_quit():
+    app = make_app()
+    click_toolbar(app, "quit")
+    assert app._quit.is_set()
+
+
+def test_toolbar_spacing_click_is_ignored():
+    app = make_app()
+    app._color = (1, 2, 3)
+    g = app._toolbar_geometry()
+    assert app._handle_csi(f"<0;1;{g['row']}", "M") == []  # padding before buttons
+    b = toolbar_button(app, "paint")
+    assert app._handle_csi(f"<0;{b.col + b.width};{g['row']}", "M") == []  # gap
+    assert app._pixels[0][0] == (10, 10, 10)  # nothing painted
+
+
+def test_toolbar_render_eraser_active_state():
+    app = make_app()
+    assert "[Eraser]" in app._render_toolbar()
+    assert "\x1b[7m[Eraser]" not in app._render_toolbar()  # off = plain
+    app._eraser = True
+    assert "\x1b[7m[Eraser]" in app._render_toolbar()  # on = reversed
+
+
+# --------------------------------------------------------------------------- #
+# Brush-size slider (Paint-style): click, live drag, clamping, throttling
+# --------------------------------------------------------------------------- #
+
+
+def test_slider_click_sets_brush_size():
+    app = make_app()
+    col, row = slider_slot(app, 5)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []  # never paints pixels
+    assert app._brush_size == 5
+
+
+def test_slider_click_at_ends_clamps():
+    app = make_app()
+    col, row = slider_slot(app, 1)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._brush_size == 1
+    col, row = slider_slot(app, BRUSH_MAX)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._brush_size == BRUSH_MAX
+    # one column past the right end of the track still clamps to the maximum
+    s = app._toolbar_geometry()["slider"]
+    app._handle_csi(f"<0;{s.col + s.width};{s.row}", "M")
+    assert app._brush_size == BRUSH_MAX
+
+
+def test_slider_drag_updates_live():
+    app = make_app()
+    s = app._toolbar_geometry()["slider"]
+    app._handle_csi(f"<0;{s.col};{s.row}", "M")  # press at size 1
+    assert app._brush_size == 1
+    app._handle_csi(f"<32;{s.col + 3};{s.row}", "M")  # drag to size 4
+    assert app._brush_size == 4
+    app._handle_csi(f"<32;{s.col + 6};{s.row}", "M")  # drag to size 7
+    assert app._brush_size == BRUSH_MAX
+
+
+def test_slider_drag_past_ends_clamps():
+    app = make_app()
+    s = app._toolbar_geometry()["slider"]
+    app._handle_csi(f"<0;{s.col - 1};{s.row}", "M")  # left margin -> size 1
+    assert app._brush_size == 1
+    app._handle_csi(f"<32;{s.col + s.width};{s.row}", "M")  # right margin -> max
+    assert app._brush_size == BRUSH_MAX
+    # dragging well beyond the track is ignored and keeps the clamp
+    app._handle_csi(f"<32;{s.col + 20};{s.row}", "M")
+    assert app._brush_size == BRUSH_MAX
+    assert app._pixels[0][0] == (10, 10, 10)  # never a canvas paint
+
+
+def test_slider_handle_renders_at_brush_size():
+    app = make_app()
+    app._brush_size = 3
+    rendered = app._render_toolbar()
+    s = app._toolbar_geometry()["slider"]
+    assert f"\x1b[{s.row};{s.col}H" in rendered  # track starts at the slider
+    assert "\x1b[7m●" in rendered  # the handle
+    assert rendered.count("─") == BRUSH_MAX - 1  # rest of the track
+
+
+def test_slider_drag_redraws_toolbar_live():
+    app = make_app()
+    out = app._console.file
+    s = app._toolbar_geometry()["slider"]
+    first = len(out.getvalue())
+    app._handle_csi(f"<0;{s.col + 4};{s.row}", "M")  # size 5
+    app._after_edit([])
+    delta = out.getvalue()[first:]
+    l = app._layout_info
+    assert app._brush_size == 5
+    assert f"\x1b[{l['top_pad'] + 2};1H\x1b[2K" in delta  # toolbar redrawn
+    assert "\x1b[7m●" in delta  # handle drawn at the new size
+    assert f"\x1b[{l['top_pad'] + 3};" not in delta  # canvas cells untouched
+
+
+def test_slider_drag_same_slot_is_noop():
+    app = make_app()
+    out = app._console.file
+    s = app._toolbar_geometry()["slider"]
+    app._handle_csi(f"<0;{s.col + 2};{s.row}", "M")  # size 3: a real change
+    app._after_edit([])  # chrome-only redraw
+    first = len(out.getvalue())
+    app._handle_csi(f"<32;{s.col + 2};{s.row}", "M")  # same slot: nothing changed
+    app._after_edit([])
+    delta = out.getvalue()[first:]
+    # Only the terminal-cursor park move is emitted — no canvas or chrome writes.
+    assert "\x1b[38;2;" not in delta
+    assert "▀" not in delta
+    assert "●" not in delta
+    assert delta.count("\x1b[") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Toolbar layout + palette interplay: centering survives the extra row
+# --------------------------------------------------------------------------- #
+
+
+def test_toolbar_layout_keeps_canvas_centered():
+    for size in [(80, 24), (120, 40), (60, 20)]:
+        app = make_app(size=size)
+        out = app._console.file
+        l = app._layout_info
+        g = app._toolbar_geometry(l)
+        assert g["row"] == l["top_pad"] + 2  # toolbar just below the header
+        assert l["content_h"] == CONTENT_H
+        assert l["top_pad"] == max(0, (size[1] - CONTENT_H) // 2)
+        assert l["left_pad"] == max(0, (size[0] - 4 * CELL_W) // 2)
+        rendered = out.getvalue()
+        assert f"\x1b[{g['row']};1H\x1b[2K" in rendered  # toolbar row drawn
+        assert f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H" in rendered
+
+
+def test_swatch_click_while_in_palette_mode_confirms():
+    app = make_app()
+    app._handle_char("\t")
+    assert app._palette_mode is True
+    col, row = palette_swatch_screen(app, 4)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._palette_mode is False  # a swatch click acts like Enter
+    assert app._color == PALETTE[4][1]

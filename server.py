@@ -759,11 +759,13 @@ def open_canvas() -> str:
     """Open a terminal window running the interactive canvas app.
 
     The window connects to this session's canvas socket. Draw with the mouse
-    (click / click-drag) or keyboard (arrow keys move the cursor, space paints,
-    x erases, e toggles the eraser, +/- changes the brush size, c cycles the
-    palette, 1-8 pick a color, Tab opens the visual palette, [ ] / { } grow or
-    shrink the canvas, q quits). Changes appear here instantly; read them back
-    with see_canvas(). Fails if no compatible terminal is found.
+    (a clickable toolbar above the canvas, a brush-size bar, palette swatches,
+    and click/click-drag painting) or keyboard (arrow keys move the cursor,
+    space paints, x erases, e toggles the eraser, +/- changes the brush size,
+    c cycles the palette, 1-8 pick a color, Tab opens the visual palette,
+    [ ] / { } grow or shrink the canvas, q quits). Changes appear here
+    instantly; read them back with see_canvas(). Fails if no compatible
+    terminal is found.
     """
     state = _server()
     launched = _launch_canvas_window(state.socket_path)
@@ -774,9 +776,9 @@ def open_canvas() -> str:
     pid = f" (launcher pid {launched.pid})" if launched.pid else ""
     return (
         f"Opened the canvas in a new {launched.terminal}{pid}. "
-        "Mouse: click/drag to paint. Keys: arrows move, space paint, x erase, "
-        "e eraser, +/- brush size, c next color, 1-8 palette, [ ]/ { } resize, "
-        "q quit."
+        "Mouse: toolbar buttons, brush bar, swatches, and click/drag to paint. "
+        "Keys: arrows move, space paint, x erase, e eraser, +/- brush size, "
+        "c next color, 1-8 palette, [ ]/ { } resize, q quit."
     )
 
 

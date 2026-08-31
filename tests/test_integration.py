@@ -229,7 +229,7 @@ def test_renderer_draws_initial_full_state() -> None:
     assert "\x1b[48;2;0;0;0m" in rendered  # bottom pixel = black background
     # first canvas cell sits at the centered position (row 19, col 37)
     l = r._layout_info
-    assert f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + 1}H" in rendered
+    assert f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H" in rendered
 
 
 def test_renderer_rewrites_only_changed_cell() -> None:
@@ -262,7 +262,7 @@ def test_renderer_rewrites_only_changed_cell() -> None:
     l = r._layout_info
     assert delta.count("▀") == 2  # one cell, two half-block columns
     assert "\x1b[38;2;0;0;255m" in delta  # the new blue foreground
-    assert f"\x1b[{l['top_pad'] + 2};{l['left_pad'] + 1}H" in delta  # centered cell
+    assert f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H" in delta  # centered cell
 
 
 # --------------------------------------------------------------------------- #
