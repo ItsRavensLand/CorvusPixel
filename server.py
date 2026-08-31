@@ -441,6 +441,11 @@ class RendererSink:
                 except OSError:
                     pass
 
+    def live_client_count(self) -> int:
+        """How many canvas windows are currently connected to the socket."""
+        with self._clients_lock:
+            return len(self._clients)
+
     def close(self) -> None:
         self._stop.set()
         if self._server is not None:
@@ -495,6 +500,11 @@ class CanvasServer:
         """The Unix socket canvas windows connect to (used by ``open_canvas``)."""
         return self._sink.socket_path
 
+    @property
+    def canvas_window_open(self) -> bool:
+        """True while at least one canvas window is connected to the socket."""
+        return self._sink.live_client_count() > 0
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return self._canvas.snapshot()
@@ -527,6 +537,8 @@ class CanvasServer:
 
     def reset(self, width: int, height: int, background: Color) -> str:
         with self._lock:
+            width = max(1, min(width, 100))  # mirror the resize-path bounds
+            height = max(1, min(height, 100))
             self._canvas = PixelCanvas(width, height, background)
             self._sink.push({"type": "full", **self._canvas.snapshot()})
             return (
@@ -752,6 +764,17 @@ def see_canvas() -> str:
     a raw pixel dump. Does not modify the canvas.
     """
     return _server().see_canvas()
+
+
+@server.tool()
+def canvas_status() -> str:
+    """Report whether a canvas window is currently connected to this session.
+
+    Returns "open" if a canvas window is connected to the session socket,
+    "closed" otherwise. Call this before ``open_canvas()`` so you never spawn
+    a duplicate window.
+    """
+    return "open" if _server().canvas_window_open else "closed"
 
 
 @server.tool()

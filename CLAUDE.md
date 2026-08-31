@@ -12,8 +12,10 @@ session-scoped Unix socket; no files.
 - `./setup.sh` — create the venv, install deps, register the MCP server with
   `claude mcp add`.
 - `.venv/bin/python server.py` — run the MCP server standalone (stdio transport).
-- In Claude Code, call `open_canvas` to open the interactive canvas window; the
-  app connects to this session's socket automatically.
+- In Claude Code, type `/canvas` (optionally `/canvas 64x64` for a size) to open
+  the interactive canvas window — the preferred way. It refuses to open a second
+  window if one is already connected to this session, and the app connects to
+  this session's socket automatically.
 
 ## Rules
 

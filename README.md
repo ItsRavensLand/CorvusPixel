@@ -8,17 +8,25 @@ in tokens) and only draws itself when you ask. No files, real time.
 ## Quick start
 
 ```bash
-./setup.sh
+./setup.sh   # once: create .venv, install deps, register the MCP server
 ```
 
-This creates a `.venv`, installs `mcp` and `rich`, and registers the server with
-`claude mcp add --scope project`. Then, in Claude Code, call the **`open_canvas`**
-tool: a full OS terminal window opens running the interactive canvas app,
-connected to this session's socket. Draw, then ask Claude to look at it
-(`see_canvas`).
+Register the CorvusPixel MCP server once, then in any Claude Code session in
+this project just type **`/canvas`** to open the drawing window — no need to
+remember tool names. Add an optional size: `/canvas 64x64` opens a fresh
+64×64 canvas.
+
+```text
+Claude Code > /canvas
+> Canvas opened. Draw, then ask Claude to look at it.
+```
+
+`/canvas` never opens a second window: if one is already connected to the
+session it just says "Canvas already open in this session."
 
 | Tool             | Description                                        |
 | ---------------- | -------------------------------------------------- |
+| `canvas_status`  | "open" / "closed" — is a canvas window connected?  |
 | `open_canvas`    | Open the interactive canvas window (user draws)    |
 | `see_canvas`     | Compact symbol grid + legend — how Claude reads it |
 | `set_pixel`      | One pixel: `set_pixel(x, y, "#rrggbb")`            |
