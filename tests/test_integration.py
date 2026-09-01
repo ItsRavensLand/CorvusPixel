@@ -417,6 +417,60 @@ def test_fill_survives_resize_over_socket() -> None:
             fake.close()
 
 
+def test_fill_over_shape_survives_single_resize_over_socket() -> None:
+    """The reported repro over the real socket: a white shape object with a
+    black fill object covering it, then ONE shrink. The resize must clip the
+    fill (and shape) to the new bounds but keep the fill covering the shape —
+    the server's ``full`` snapshot must not drop the fill."""
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "fill_shape_resize.sock")
+        cs = CanvasServer(sock_path, width=16, height=8, background=(0, 0, 0))
+        cs.start()
+        fake = FakeRenderer(sock_path)
+        try:
+            fake.connect()
+            fake.read_message()  # the initial full snapshot
+
+            shape_px = [[x, y] for x in range(5, 12) for y in range(3, 7)]  # 7x4
+            fill_px = [[x, y] for x in range(5, 12) for y in range(3, 7)]   # covers it
+            app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            app.connect(sock_path)
+            app.sendall((json.dumps({
+                "type": "objects",
+                "objects": [
+                    {"id": 1, "kind": "shape", "color": [255, 255, 255],
+                     "data": {"shape_type": "filled_rect", "x1": 5, "y1": 3,
+                              "x2": 11, "y2": 6, "thickness": 1},
+                     "pixels": shape_px},
+                    {"id": 2, "kind": "fill", "color": [0, 0, 0],
+                     "data": {"pixel_count": len(fill_px)},
+                     "pixels": fill_px},
+                ],
+            }) + "\n").encode())
+            fake.read_message()  # objects echo
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][4][8] == [0, 0, 0]        # fill on top, covers shape
+
+            # ONE shrink to 10x8: rightmost 2 columns of the fill/shape clip away.
+            app.sendall((json.dumps({"type": "resize", "width": 10, "height": 8}) + "\n").encode())
+            msg = fake.read_message()
+            assert msg["type"] == "full"
+            assert msg["width"] == 10 and msg["height"] == 8
+            by_kind = {o["kind"]: o for o in msg["objects"]}
+            assert set(by_kind) == {"shape", "fill"}         # the fill was NOT dropped
+            shape = by_kind["shape"]; fill = by_kind["fill"]
+            assert fill["pixels"]
+            assert all(x < 10 and y < 8 for x, y in fill["pixels"])
+            assert set(map(tuple, shape["pixels"])) <= set(map(tuple, fill["pixels"]))
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][4][8] == [0, 0, 0]         # still covered, not white
+            assert data["pixels"][4][5] == [0, 0, 0]
+            app.close()
+        finally:
+            cs.close()
+            fake.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. Renderer: applies messages and draws only the cells that changed
 # --------------------------------------------------------------------------- #

@@ -588,6 +588,74 @@ def test_fill_survives_grow_and_shrink_resize():
     assert app._render_color(2, 2) == (0, 255, 0)
 
 
+def test_fill_over_shape_object_survives_single_shrink():
+    """The exact reported repro: a white filled-rect SHAPE object, then a bucket
+    fill covers it, then ONE ``[`` keypress. The fill must survive (clipped to
+    the new bounds) and keep covering the shape — the shape must NOT reappear.
+
+    The older ``test_fill_survives_grow_and_shrink_resize`` fills an *empty*
+    background; this one covers the case that report was actually about: content
+    (a shape object) underneath the fill, on the real single-keypress path."""
+    app = text_app()  # 40x16
+    # 1. white filled-rect shape via the real shape-tool drag: (5,4)-(15,7) in
+    #    display rows -> canvas (5,8)-(15,14).
+    app._color = (255, 255, 255)
+    app._tool = TOOL_FILLED_RECT
+    shape_press(app, 5, 4); shape_drag(app, 15, 7); shape_release(app, 15, 7)
+    shapes = [o for o in app._objects if o.kind == "shape"]
+    assert len(shapes) == 1
+    shape = shapes[0]
+    cx = min(x for x, _ in shape.pixels) + 2
+    cy = min(y for _, y in shape.pixels) + 2
+
+    # 2. bucket-fill black over the shape, covering it.
+    app._color = (0, 0, 0)
+    app._tool = TOOL_FILL
+    app._flood_fill(cx, cy)
+    fills = [o for o in app._objects if o.kind == "fill"]
+    assert len(fills) == 1
+    assert shape.pixels <= fills[0].pixels       # the fill covers the shape
+    assert app._render_color(cx, cy) == (0, 0, 0)
+
+    # 3. ONE shrink keypress.
+    app._handle_char("[")
+    app._after_edit([])
+    assert app._width == 39
+    fills = [o for o in app._objects if o.kind == "fill"]
+    shapes = [o for o in app._objects if o.kind == "shape"]
+    assert fills and shapes                       # neither object was dropped
+    assert fills[0].pixels
+    assert shapes[0].pixels <= fills[0].pixels    # the shape is still covered
+    assert app._render_color(cx, cy) == (0, 0, 0)  # still black, not the shape
+
+
+def test_fill_over_base_content_survives_single_shrink():
+    """Variant with the covered content in the BASE raster (freehand brush)
+    rather than a shape object: fill over it, one ``[``, and the fill must
+    still cover it — the base must not show back through the fill."""
+    app = text_app()
+    app._color = (255, 255, 255)
+    for y in range(4, 9):
+        for x in range(5, 16):
+            app._paint(x, y, (255, 255, 255))
+    assert app._render_color(8, 6) == (255, 255, 255)
+    app._color = (0, 0, 0)
+    app._tool = TOOL_FILL
+    app._flood_fill(8, 6)
+    fills = [o for o in app._objects if o.kind == "fill"]
+    assert len(fills) == 1
+    assert (8, 6) in fills[0].pixels
+    assert app._render_color(8, 6) == (0, 0, 0)
+
+    app._handle_char("[")
+    app._after_edit([])
+    assert app._width == 39
+    fills = [o for o in app._objects if o.kind == "fill"]
+    assert fills and (8, 6) in fills[0].pixels    # the fill is still there
+    assert app._render_color(8, 6) == (0, 0, 0)   # still covering the base
+    assert app._render_color(8, 6) != (255, 255, 255)  # the white did NOT reappear
+
+
 def test_rapid_resize_spam_never_raises_and_stays_consistent():
     """Spamming the grow/shrink shortcuts must never raise, and afterwards the
     dimensions, pixel grid and every object stay mutually consistent."""
