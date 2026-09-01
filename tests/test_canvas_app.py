@@ -12,6 +12,7 @@ Run with:  .venv/bin/python -m pytest
 import io
 import re
 import socket
+import string
 
 from rich.console import Console
 
@@ -19,21 +20,28 @@ from canvas_app import (
     BRUSH_MAX,
     BRUSH_MIN,
     CELL_W,
+    FONT_H,
+    FONT_W,
     MAX_CANVAS,
     MIN_CANVAS,
     PALETTE,
     QUICK_COLORS,
     TOOL_ERASER,
+    TOOL_FILL,
     TOOL_FILLED_RECT,
     TOOL_FILLED_SQUARE,
     TOOL_HOLLOW_RECT,
     TOOL_HOLLOW_SQUARE,
     TOOL_LINE,
     TOOL_PAINT,
+    TOOL_TEXT,
+    _FONT5X7,
     CanvasApp,
     ToolButton,
     bresenham,
     fill_rect_cells,
+    flood_fill_region,
+    glyph_pixels,
     hollow_rect_cells,
     square_end,
     thick_line_cells,
@@ -1249,6 +1257,7 @@ def test_shape_toolbar_right_aligned_and_selects():
     assert shape["row"] == app._layout_info["top_pad"] + 1  # the header row
     assert [b.ident for b in shape["buttons"]] == [
         "filled_rect", "filled_square", "hollow_rect", "hollow_square", "line",
+        "fill", "text",
     ]
     last = shape["buttons"][-1]
     assert last.col + last.width - 1 <= 80  # right-aligned, fits the terminal
@@ -1307,9 +1316,9 @@ def test_shortcuts_panel_full_grouping_on_wide_terminal():
     # The quick-colour row leaves a 57-column left margin: all six groups fit,
     # packed into lines with a short labelled header per group.
     assert app._shortcuts_panel(avail=57) == [
-        [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−"),
-         ("Shapes", "p·r·o·f·s·l")],
-        [("Canvas", "[ ]·{ }·Tab"), ("Other", "c·1-8·q")],
+        [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−")],
+        [("Shapes", "p·r·o·f·s·l·b·t"), ("Canvas", "[ ]·{ }·Tab"),
+         ("Other", "c·1-8·q")],
     ]
 
 
@@ -1333,7 +1342,7 @@ def test_shortcuts_panel_renders_bottom_left():
     for header in ("Move", "Draw", "Brush", "Shapes", "Canvas", "Other"):
         assert header in rendered
     assert "space·x·e" in rendered
-    assert "p·r·o·f·s·l" in rendered
+    assert "p·r·o·f·s·l·b·t" in rendered
     assert "c·1-8·q" in rendered
     # Left-aligned on the palette-indicator row: the bottom-left corner.
     layout = app._layout_info
@@ -1362,3 +1371,369 @@ def test_shortcuts_panel_not_rewritten_on_noop_redraw():
     delta = out.getvalue()[first:]
     assert "space·x·e" not in delta  # panel is diffed: not rewritten
     assert "\x1b[38;2;" not in delta  # no header recolour either
+
+
+# --------------------------------------------------------------------------- #
+# Bucket fill: pure flood-fill region + the app tool (single batched update)
+# --------------------------------------------------------------------------- #
+
+
+def test_flood_fill_region_single_isolated_pixel():
+    grid = [
+        [(10, 10, 10), (10, 10, 10), (10, 10, 10)],
+        [(10, 10, 10), (255, 0, 0), (10, 10, 10)],
+        [(10, 10, 10), (10, 10, 10), (10, 10, 10)],
+    ]
+    assert flood_fill_region(grid, 1, 1) == {(1, 1)}
+
+
+def test_flood_fill_region_fills_whole_canvas():
+    grid = [[(0, 0, 0)] * 3 for _ in range(3)]
+    assert flood_fill_region(grid, 0, 0) == {(x, y) for x in range(3) for y in range(3)}
+
+
+def test_flood_fill_region_stops_at_a_wall():
+    grid = [
+        [(0, 0, 0)] * 5,
+        [(0, 0, 0), (255, 0, 0), (255, 0, 0), (255, 0, 0), (0, 0, 0)],
+        [(0, 0, 0), (255, 0, 0), (0, 0, 0), (255, 0, 0), (0, 0, 0)],
+        [(0, 0, 0), (255, 0, 0), (255, 0, 0), (255, 0, 0), (0, 0, 0)],
+        [(0, 0, 0)] * 5,
+    ]
+    # the enclosed background centre is a separate region from the outside
+    assert flood_fill_region(grid, 2, 2) == {(2, 2)}
+    outer = flood_fill_region(grid, 0, 0)
+    assert (0, 0) in outer and (4, 4) in outer
+    assert (2, 2) not in outer  # the red ring is a wall for the fill
+
+
+def test_flood_fill_region_is_four_connected_not_diagonal():
+    grid = [
+        [(0, 0, 0), (1, 1, 1)],
+        [(1, 1, 1), (0, 0, 0)],
+    ]
+    assert flood_fill_region(grid, 0, 0) == {(0, 0)}  # only diagonally adjacent
+
+
+def test_flood_fill_region_out_of_bounds_is_empty():
+    assert flood_fill_region([[ (0, 0, 0) ]], -1, 0) == set()
+    assert flood_fill_region([], 0, 0) == set()
+
+
+def test_fill_tool_isolated_pixel_only():
+    app = make_app()
+    app._tool = TOOL_FILL
+    app._pixels[0][2] = (255, 0, 0)  # a lone red pixel, neighbours are background
+    app._color = (0, 255, 0)
+    col, row = cell_screen(app, 2, 0)  # the cell containing pixel (2,0)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == [
+        {"x": 2, "y": 0, "color": [0, 255, 0]}
+    ]
+
+
+def test_fill_tool_fills_whole_canvas():
+    app = make_app()  # 4x4 all background: one giant region
+    app._tool = TOOL_FILL
+    app._color = (255, 0, 0)
+    col, row = cell_screen(app, 0, 0)
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
+    assert len(changes) == 16
+    assert all(p == (255, 0, 0) for row in app._pixels for p in row)
+
+
+def test_fill_tool_noop_when_color_matches():
+    app = make_app()
+    app._tool = TOOL_FILL
+    app._color = (10, 10, 10)  # the background colour
+    col, row = cell_screen(app, 2, 0)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+def test_fill_tool_does_not_cross_a_wall():
+    app = make_app()
+    app._tool = TOOL_FILL
+    for x in range(4):
+        app._pixels[2][x] = (255, 0, 0)  # a wall across row 2
+    app._color = (0, 255, 0)
+    col, row = cell_screen(app, 1, 0)  # click above the wall (pixel (1,0))
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
+    assert {(c["x"], c["y"]) for c in changes} == {
+        (x, y) for x in range(4) for y in range(2)
+    }
+    assert app._pixels[2][0] == (255, 0, 0)  # the wall survives
+    assert app._pixels[3][3] == (10, 10, 10)  # below the wall untouched
+
+
+def test_fill_tool_sends_single_batched_update():
+    app = make_app()
+    app._tool = TOOL_FILL
+    app._color = (255, 0, 0)
+    sent = []
+    app._send_edit = lambda changes: sent.append(changes)
+    col, row = cell_screen(app, 0, 0)
+    changes = app._handle_csi(f"<0;{col};{row}", "M")
+    app._after_edit(changes)
+    assert len(changes) == 16  # one flat batch of every pixel
+    assert len(sent) == 1  # exactly one edit message, not one per pixel
+    assert len(sent[0]) == 16
+
+
+def test_fill_drag_does_not_fill():
+    app = make_app()
+    app._tool = TOOL_FILL
+    app._color = (255, 0, 0)
+    col, row = cell_screen(app, 1, 0)
+    assert app._handle_csi(f"<32;{col};{row}", "M") == []  # a drag, not a press
+    assert app._pixels[0][0] == (10, 10, 10)
+
+
+def test_fill_and_text_hotkeys_and_buttons_select():
+    app = make_app()
+    for hotkey, tool in (("b", TOOL_FILL), ("t", TOOL_TEXT)):
+        app._handle_char(hotkey)
+        assert app._tool == tool
+    for ident, tool in (("fill", TOOL_FILL), ("text", TOOL_TEXT)):
+        b = next(x for x in app._shape_toolbar_geometry()["buttons"] if x.ident == ident)
+        app._handle_csi(f"<0;{b.col};{b.row}", "M")
+        assert app._tool == tool
+
+
+def test_top_line_shows_fill_and_text_labels():
+    app = make_app()
+    # The header word can truncate on a narrow terminal, but the right-aligned
+    # shape buttons always render: check for the actual [Fill]/[Text] labels.
+    app._tool = TOOL_FILL
+    assert "\x1b[7m[Fill]" in app._render_top_line()  # active -> reversed video
+    app._tool = TOOL_TEXT
+    assert "\x1b[7m[Text]" in app._render_top_line()
+    app._tool = TOOL_FILLED_RECT  # inactive buttons render plain
+    assert "[Fill]" in app._render_top_line() and "[Text]" in app._render_top_line()
+
+
+def test_fill_tool_space_fills_at_cursor():
+    app = make_app()
+    app._handle_char("b")
+    app._color = (0, 255, 0)
+    app._cursor_x, app._cursor_y = 1, 1
+    changes = app._handle_char(" ")
+    assert len(changes) == 16  # the whole background is one region
+    assert app._pixels[3][3] == (0, 255, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Text tool: 5x7 bitmap font + the session state machine
+# --------------------------------------------------------------------------- #
+
+
+def text_app(width=40, height=16, term=(120, 40)) -> CanvasApp:
+    """A 40x16 canvas in a big terminal, so a full line of 5x7 text fits."""
+    out = io.StringIO()
+    console = Console(
+        file=out, force_terminal=True, color_system="truecolor",
+        width=term[0], height=term[1], force_interactive=True, legacy_windows=False,
+    )
+    app = CanvasApp(
+        "/tmp/nonexistent.sock", background=(10, 10, 10),
+        console=console, input_stream=io.StringIO(), size_provider=lambda: term,
+    )
+    app._blink_active = True
+    app._apply({
+        "type": "full",
+        "width": width,
+        "height": height,
+        "background": [10, 10, 10],
+        "pixels": [[[10, 10, 10]] * width for _ in range(height)],
+    })
+    return app
+
+
+def test_font_covers_uppercase_lowercase_digits_and_punctuation():
+    punctuation = set(".,-!?_()[]{}`~+*/\\|'\":;=<>^#%&@$")
+    supported = set(_FONT5X7)
+    assert set(string.ascii_uppercase) <= supported
+    assert set(string.ascii_lowercase) <= supported
+    assert set(string.digits) <= supported
+    assert punctuation <= supported
+    assert len(_FONT5X7) > 80  # a real font, not a stub
+
+
+def test_font_every_glyph_is_5x7_with_a_lit_pixel():
+    for char, pattern in _FONT5X7.items():
+        assert len(pattern) == FONT_H == 7, char
+        for row in pattern:
+            assert len(row) == FONT_W == 5, char
+            assert set(row) <= {".", "#"}, char
+        assert any("#" in row for row in pattern), char
+        assert glyph_pixels(char, 0, 0)  # renders at least one pixel
+
+
+def test_glyph_pixels_positions_at_origin_and_offset():
+    px = glyph_pixels("H", 3, 4)
+    assert (3, 4) in px and (7, 4) in px  # first row, both lit corners
+    assert (3, 10) in px and (7, 10) in px  # last row (4 + FONT_H - 1)
+    assert all(3 <= x < 3 + FONT_W and 4 <= y < 4 + FONT_H for x, y in px)
+    assert glyph_pixels(" ", 0, 0) == set()  # space has no glyph box
+
+
+def test_text_click_places_insertion_point():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    col, row = cell_screen(app, 3, 2)  # cell (3,2) -> pixel (3,4)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._text_active is True
+    assert (app._text_x, app._text_y) == (3, 4)
+    assert (app._cursor_x, app._cursor_y) == (3, 4)
+
+
+def test_text_typing_draws_and_advances():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(2, 2)
+    changes = app._handle_char("H")
+    assert changes and all(c["color"] == [255, 0, 0] for c in changes)
+    assert all(c["y"] in range(2, 2 + FONT_H) for c in changes)
+    assert app._text_x == 2 + FONT_W + 1  # advanced past the 5-wide glyph
+    app._handle_char("i")
+    assert app._text_x == 2 + 2 * (FONT_W + 1)
+
+
+def test_text_mouse_click_then_type():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (0, 0, 255)
+    col, row = cell_screen(app, 0, 0)
+    app._handle_csi(f"<0;{col};{row}", "M")  # place at (0,0)
+    changes = app._handle_char("A")
+    # "A" row 0 is ".###." so the lit top-left pixel is (1,0), not (0,0)
+    assert (1, 0) in {(c["x"], c["y"]) for c in changes}
+
+
+def test_text_backspace_erases_last_char():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(1, 1)
+    app._handle_char("A")
+    app._handle_char("B")
+    before = app._text_x
+    changes = app._handle_char("\x7f")  # backspace
+    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._text_x == before - (FONT_W + 1)  # insertion stepped back
+    # "A" row 0 is ".###." so at (1,1) the lit column is x=2 -> pixel (2,1)
+    assert app._pixels[1][2] == (255, 0, 0)  # A is still there
+    app._handle_char("\x7f")  # backspace again removes A
+    assert app._text_x == 1
+    assert app._pixels[1][2] == (10, 10, 10)
+
+
+def test_text_escape_reverts_whole_session():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(2, 2)
+    app._handle_char("H")
+    app._handle_char("i")
+    changes = app._read_escape_sequence()  # a stray ESC (no CSI) cancels
+    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._text_active is False
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+def test_text_enter_moves_to_new_line():
+    app = text_app(height=24)  # tall enough that y=10 line (rows 10..16) fits
+    app._tool = TOOL_TEXT
+    app._text_place(4, 2)
+    app._handle_char("H")
+    assert app._handle_char("\r") == []
+    assert app._text_x == 4  # the new line starts at the session's start x
+    assert app._text_y == 2 + FONT_H + 1
+
+
+def test_text_enter_out_of_bounds_is_ignored():
+    app = text_app(height=12)  # bottom edge at y=11
+    app._tool = TOOL_TEXT
+    app._text_place(2, 4)  # next line would need rows 12..18: no room
+    assert app._handle_char("\r") == []
+    assert (app._text_x, app._text_y) == (2, 4)
+
+
+def test_text_out_of_bounds_right_edge_stops_accepting():
+    app = text_app(width=20)
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(15, 2)  # 15 + FONT_W == 20: exactly fits
+    assert app._handle_char("H")  # fits: drawn
+    assert app._text_x == 15 + FONT_W + 1
+    assert app._handle_char("I") == []  # would overflow: not accepted
+    assert app._text_x == 15 + FONT_W + 1  # did not advance
+    assert all(p == (10, 10, 10) for p in app._pixels[2][20:])  # nothing past
+
+
+def test_text_switching_tool_finalizes_and_commits():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(2, 2)
+    app._handle_char("H")
+    app._handle_char("p")  # while typing, 'p' draws a glyph, it does NOT switch
+    assert app._tool == TOOL_TEXT
+    assert app._text_active is True
+    b = app._shape_toolbar_geometry()["buttons"][0]  # the filled-rect button
+    app._handle_csi(f"<0;{b.col};{b.row}", "M")  # switch tool via the mouse
+    assert app._tool == TOOL_FILLED_RECT
+    assert app._text_active is False  # finalized: nothing more to revert
+    assert app._pixels[2][2] == (255, 0, 0)  # the typed text stays committed
+
+
+def test_text_click_elsewhere_starts_a_fresh_session():
+    app = text_app(height=24)  # the "E" at y=10 needs rows 10..16
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(2, 2)
+    app._handle_char("H")
+    col, row = cell_screen(app, 1, 5)  # click the canvas elsewhere
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._text_active is True
+    assert (app._text_x, app._text_y) == (1, 10)
+    assert app._pixels[2][2] == (255, 0, 0)  # the old text is committed
+    app._handle_char("E")
+    app._read_escape_sequence()  # Escape only reverts the NEW session
+    assert app._pixels[2][2] == (255, 0, 0)  # old H remains
+    assert app._pixels[10][1] == (10, 10, 10)  # new E reverted
+
+
+def test_text_space_advances_without_drawing():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(0, 0)
+    assert app._handle_char(" ") == []
+    assert app._text_x == FONT_W + 1
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+    app._handle_char("\x7f")  # backspace undoes the space
+    assert app._text_x == 0
+
+
+def test_text_punctuation_renders():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    for ch in ".,!?-()":
+        assert glyph_pixels(ch, 0, 0)  # every punctuation glyph has pixels
+    app._text_place(0, 0)
+    assert app._handle_char("!")  # '!' draws
+
+
+def test_text_changes_are_sent_as_normal_edits():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(0, 0)
+    sent = []
+    app._send_edit = lambda changes: sent.append(changes)
+    changes = app._handle_char("H")
+    app._after_edit(changes)
+    assert len(sent) == 1
+    assert all({"x", "y", "color"} <= set(c) for c in sent[0])  # server-ready dicts

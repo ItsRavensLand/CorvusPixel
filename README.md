@@ -48,7 +48,13 @@ session it just says "Canvas already open in this session."
   **shape tool** from the top-right corner of the window (filled/hollow
   rectangle or square, or a straight line) and click-drag on the canvas to draw:
   a dimmed preview follows the cursor, release commits the shape in the current
-  color, Escape cancels it.
+  color, Escape cancels it. The **fill** and **text** tools sit in the same
+  top-right corner: with **fill**, one click flood-fills the whole 4-connected
+  same-color region under the cursor with the current color; with **text**, a
+  click places the insertion point and typing draws 5×7 bitmap characters in the
+  current color — Backspace erases the last character, Enter moves to a new
+  line below, and Escape cancels the whole in-progress session (click elsewhere
+  or switch tools to finalize it).
 - **Keyboard**
   - A live reminder of all these shortcuts sits in the bottom-left corner of the
     window, packed into small labelled groups (move / draw / brush / shapes /
@@ -64,6 +70,9 @@ session it just says "Canvas already open in this session."
     `f`/`s` — filled / hollow square tool ·
     `l` — straight-line tool (each draws on a click-drag; outline and line
     thickness follow the brush size) · `p` — back to the paint tool
+  - `b` — bucket fill: one click flood-fills the connected same-color region ·
+    `t` — text tool: click to place the insertion point, type to draw,
+    Backspace erases, Enter moves to a new line, Escape cancels the session
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
     the toolbar's brush bar does the same with the mouse)
   - `[`/`]` — shrink/grow the canvas width (right edge) ·

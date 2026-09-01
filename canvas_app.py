@@ -8,22 +8,30 @@ draw:
   brush (idempotently — painting the same pixel twice never toggles it back);
   ``x`` erases; ``e`` toggles the eraser tool; ``p`` returns to the paint tool;
   ``r``/``o``/``f``/``s``/``l`` select the filled-rect / hollow-rect /
-  filled-square / hollow-square / line tools; ``+``/``-`` grow/shrink the
-  square brush; ``[``/``]`` and ``{``/``}`` grow/shrink the canvas (columns at
-  the right edge, rows at the bottom edge); ``c`` cycles the palette; ``1``-
-  ``8`` pick a palette color; ``Tab`` opens the visual palette (arrow keys +
-  Enter/space select); ``q`` or Ctrl+C quits.
+  filled-square / hollow-square / line tools; ``b`` selects the bucket-fill
+  tool (a click flood-fills the connected same-colour region); ``t`` selects
+  the text tool (a click places a text caret, typing draws in a small bitmap
+  font, backspace erases, Enter starts a new line, Escape reverts the whole
+  session); ``+``/``-`` grow/shrink the square brush; ``[``/``]`` and
+  ``{``/``}`` grow/shrink the canvas (columns at the right edge, rows at the
+  bottom edge); ``c`` cycles the palette; ``1``-``8`` pick a palette color;
+  ``Tab`` opens the visual palette (arrow keys + Enter/space select); ``q`` or
+  Ctrl+C quits.
 - **Mouse**: a clickable toolbar above the canvas — buttons for paint, eraser,
   brush size, palette, column/row resize and quit, plus a Paint-style brush-size
-  bar (click it, or drag the ``●`` handle, to size the brush). Five shape tools
-  (filled/hollow rectangle and square, plus a straight line) live at the
-  right-hand end of the top row: click one to select it, then click-drag on the
-  canvas — a dimmed preview follows the cursor and is committed on release
-  (Escape cancels). Clicking (or click-dragging) on the canvas paints with the
-  current brush; clicking a palette swatch selects that color. A second row of
-  common-colour swatches sits at the bottom, ending in a rainbow "custom
-  colour" swatch that opens a small hex input (type ``#rrggbb`` digits, Enter
-  to pick, Esc to cancel).
+  bar (click it, or drag the ``●`` handle, to size the brush). Seven drawing
+  tools (filled/hollow rectangle and square, a straight line, bucket fill and
+  text) live at the right-hand end of the top row: click one to select it.
+  Shape tools then click-drag on the canvas — a dimmed preview follows the
+  cursor and is committed on release (Escape cancels). The bucket fill paints
+  the connected same-colour region in one click. The text tool places a caret
+  where you click; typing draws each character in the current colour, backspace
+  erases the last character, Enter starts a new line below, and Escape reverts
+  everything typed in this session. Clicking (or click-dragging) on the canvas
+  paints with the current brush; clicking a palette swatch selects that color.
+  A second row of common-colour swatches sits at the bottom, ending in a
+  rainbow "custom colour" swatch that opens a small hex input (type
+  ``#rrggbb`` digits, Enter to pick, Esc to cancel).
 - **Layout**: the canvas is centered in the terminal (horizontally and
   vertically) and re-centered when the terminal is resized (SIGWINCH). The
   cursor is a blinking reverse-video block framed by ``[ ]`` brackets so its
@@ -195,6 +203,8 @@ TOOL_FILLED_SQUARE = "filled_square"
 TOOL_HOLLOW_RECT = "hollow_rect"
 TOOL_HOLLOW_SQUARE = "hollow_square"
 TOOL_LINE = "line"
+TOOL_FILL = "fill"
+TOOL_TEXT = "text"
 
 SHAPE_TOOLS = (
     TOOL_FILLED_RECT,
@@ -212,17 +222,23 @@ _TOOL_LABELS: dict[str, str] = {
     TOOL_HOLLOW_RECT: "hollow",
     TOOL_HOLLOW_SQUARE: "hollow-sq",
     TOOL_LINE: "line",
+    TOOL_FILL: "fill",
+    TOOL_TEXT: "text",
 }
 
-# The five shape tools, shown right-aligned on the top (header) row — a distinct
+# The drawing tools, shown right-aligned on the top (header) row — a distinct
 # region from the centered toolbar. Same (ident, label, icon, action) convention
-# as ``_TOOLBAR_SPEC`` so rendering and hit-testing share one spec.
+# as ``_TOOLBAR_SPEC`` so rendering and hit-testing share one spec. The fill and
+# text tools are click tools, not click-drag shapes, so they are NOT in
+# ``SHAPE_TOOLS`` (that tuple drives the drag -> preview -> commit state machine).
 _SHAPE_SPEC: list[tuple[str, str, str, str]] = [
     ("filled_rect", "[FR]", "▬", "_tool_filled_rect"),
     ("filled_square", "[FS]", "■", "_tool_filled_square"),
     ("hollow_rect", "[HR]", "▭", "_tool_hollow_rect"),
     ("hollow_square", "[HS]", "□", "_tool_hollow_square"),
     ("line", "[Line]", "╱", "_tool_line"),
+    ("fill", "[Fill]", "▩", "_tool_fill"),
+    ("text", "[Text]", "A", "_tool_text"),
 ]
 
 # The keyboard-shortcut help panel in the bottom-left margin of the chrome:
@@ -232,7 +248,7 @@ _SHORTCUT_GROUPS: list[tuple[str, list[str]]] = [
     ("Move", ["←↑↓→"]),
     ("Draw", ["space", "x", "e"]),
     ("Brush", ["+", "−"]),
-    ("Shapes", ["p", "r", "o", "f", "s", "l"]),
+    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t"]),
     ("Canvas", ["[ ]", "{ }", "Tab"]),
     ("Other", ["c", "1-8", "q"]),
 ]
@@ -344,6 +360,169 @@ def hex_str(color: Color) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Bucket fill (pure function, no app state — directly testable)
+# --------------------------------------------------------------------------- #
+
+
+def flood_fill_region(
+    grid: list[list[Color]], x: int, y: int
+) -> set[tuple[int, int]]:
+    """Every pixel 4-connected to (x, y) that shares grid[y][x]'s colour.
+
+    Iterative (explicit stack), so a 100x100 canvas — up to 10,000 connected
+    pixels — never hits Python's recursion limit. ``grid`` is a 2-D list of
+    colour tuples (the app's ``_pixels`` shape). Out-of-bounds starts return an
+    empty set.
+    """
+    height = len(grid)
+    if height == 0:
+        return set()
+    width = len(grid[0])
+    if not (0 <= x < width and 0 <= y < height):
+        return set()
+    target = grid[y][x]
+    region: set[tuple[int, int]] = set()
+    stack: list[tuple[int, int]] = [(x, y)]
+    while stack:
+        cx, cy = stack.pop()
+        if (cx, cy) in region:
+            continue
+        if not (0 <= cx < width and 0 <= cy < height):
+            continue
+        if grid[cy][cx] != target:
+            continue  # a different colour is a wall for the fill
+        region.add((cx, cy))
+        stack.append((cx - 1, cy))
+        stack.append((cx + 1, cy))
+        stack.append((cx, cy - 1))
+        stack.append((cx, cy + 1))
+    return region
+
+
+# --------------------------------------------------------------------------- #
+# Text tool: a tiny 5x7 bitmap font + pure pixel math (directly testable)
+# --------------------------------------------------------------------------- #
+
+# Each character is 7 rows of exactly 5 columns; '#' = lit pixel, '.' = off.
+# Covers uppercase, lowercase, digits and basic punctuation; space is handled
+# specially by the text tool (advance only, no pixels).
+FONT_W = 5
+FONT_H = 7
+FONT_SPACING = 1   # terminal columns between characters
+FONT_LINE_SPACING = 1  # rows between lines
+
+_FONT5X7: dict[str, tuple[str, ...]] = {
+    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
+    "C": (".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."),
+    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
+    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
+    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
+    "G": (".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".####"),
+    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "I": (".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
+    "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
+    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
+    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
+    "N": ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
+    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
+    "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
+    "R": ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
+    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
+    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "V": ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
+    "W": ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"),
+    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
+    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
+    "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
+    "a": (".....", ".....", ".###.", "....#", ".####", "#...#", ".####"),
+    "b": ("#....", "#....", "####.", "#...#", "#...#", "#...#", "####."),
+    "c": (".....", ".....", ".###.", "#....", "#....", "#...#", ".###."),
+    "d": ("....#", "....#", ".####", "#...#", "#...#", "#...#", ".####"),
+    "e": (".....", ".....", ".###.", "#...#", "#####", "#....", ".####"),
+    "f": ("..##.", ".#...", ".#...", "####.", ".#...", ".#...", ".#..."),
+    "g": (".....", ".####", "#...#", "#...#", ".####", "....#", ".###."),
+    "h": ("#....", "#....", "####.", "#...#", "#...#", "#...#", "#...#"),
+    "i": ("..#..", ".....", ".##..", "..#..", "..#..", "..#..", ".###."),
+    "j": ("...#.", ".....", "..##.", "...#.", "...#.", "...#.", "#..#."),
+    "k": ("#....", "#....", "#..#.", "#.#..", "##...", "#.#..", "#..##"),
+    "l": (".##..", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "m": (".....", ".....", "##.#.", "#.#.#", "#.#.#", "#.#.#", "#...#"),
+    "n": (".....", ".....", "####.", "#...#", "#...#", "#...#", "#...#"),
+    "o": (".....", ".....", ".###.", "#...#", "#...#", "#...#", ".###."),
+    "p": (".....", "####.", "#...#", "#...#", "####.", "#....", "#...."),
+    "q": (".....", ".####", "#...#", "#...#", ".####", "....#", "....#"),
+    "r": (".....", ".....", "#.##.", "##..#", "#....", "#....", "#...."),
+    "s": (".....", ".....", ".####", "#....", ".###.", "....#", "####."),
+    "t": (".#...", ".#...", "####.", ".#...", ".#...", ".#...", "..##."),
+    "u": (".....", ".....", "#...#", "#...#", "#...#", "#...#", ".####"),
+    "v": (".....", ".....", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
+    "w": (".....", ".....", "#...#", "#...#", "#.#.#", "#.#.#", "##.##"),
+    "x": (".....", ".....", "#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "y": (".....", "#...#", "#...#", "#...#", ".####", "....#", ".###."),
+    "z": (".....", ".....", "#####", "...#.", "..#..", ".#...", "#####"),
+    "0": (".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."),
+    "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    "3": ("#####", "....#", "...#.", ".###.", "....#", "#...#", ".###."),
+    "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    "5": ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    "6": ("..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."),
+    "7": ("#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."),
+    "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    "9": (".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."),
+    ".": (".....", ".....", ".....", ".....", ".....", "..#..", "..#.."),
+    ",": (".....", ".....", ".....", ".....", "..#..", "..#..", ".#..."),
+    "-": (".....", ".....", ".....", "#####", ".....", ".....", "....."),
+    "_": (".....", ".....", ".....", ".....", ".....", ".....", "#####"),
+    "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
+    "?": (".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."),
+    "(": ("...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."),
+    ")": (".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."),
+    "[": ("..##.", "..#..", "..#..", "..#..", "..#..", "..#..", "..##."),
+    "]": (".##..", "..#..", "..#..", "..#..", "..#..", "..#..", ".##.."),
+    "{": ("...#.", "..#..", "..#..", ".##..", "..#..", "..#..", "...#."),
+    "}": (".#...", "..#..", "..#..", "..##.", "..#..", "..#..", ".#..."),
+    "/": ("....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."),
+    "\\": ("#....", ".#...", ".#...", "..#..", "...#.", "...#.", "....#"),
+    "|": ("..#..", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
+    "=": (".....", ".....", "#####", ".....", "#####", ".....", "....."),
+    "*": (".....", "#.#.#", ".#.#.", "#####", ".#.#.", "#.#.#", "....."),
+    ":": (".....", "..#..", "..#..", ".....", "..#..", "..#..", "....."),
+    ";": (".....", "..#..", "..#..", ".....", "..#..", "..#..", ".#..."),
+    "'": ("..#..", "..#..", ".....", ".....", ".....", ".....", "....."),
+    '"': (".#.#.", ".#.#.", ".....", ".....", ".....", ".....", "....."),
+    "#": (".#.#.", "#####", ".#.#.", ".#.#.", "#####", ".#.#.", "....."),
+    "$": ("..#..", ".####", "#..#.", ".###.", "..#.#", "####.", "..#.."),
+    "%": ("##...", "##..#", "...#.", "..#..", ".#...", "#..##", "...##"),
+    "&": (".##..", "#..#.", "#.#..", ".##..", "#.#.#", "#..#.", ".##.#"),
+    "@": (".###.", "#...#", "#.###", "#.###", "#.###", "#....", ".###."),
+    "<": ("...#.", "..#..", ".#...", ".#...", "..#..", "...#.", "....."),
+    ">": (".#...", "..#..", "...#.", "...#.", "..#..", ".#...", "....."),
+    "^": ("..#..", ".#.#.", "#...#", ".....", ".....", ".....", "....."),
+    "~": (".....", ".....", ".##.#", "#.##.", ".....", ".....", "....."),
+    "`": (".#...", "..#..", ".....", ".....", ".....", ".....", "....."),
+}
+
+
+def glyph_pixels(char: str, x: int, y: int) -> set[tuple[int, int]]:
+    """The lit pixels of ``char`` drawn with its top-left corner at (x, y)."""
+    pattern = _FONT5X7.get(char)
+    if pattern is None:
+        return set()
+    return {
+        (x + px, y + py)
+        for py, row in enumerate(pattern)
+        for px, cell in enumerate(row)
+        if cell == "#"
+    }
+
+
+# --------------------------------------------------------------------------- #
 # The interactive canvas app
 # --------------------------------------------------------------------------- #
 
@@ -389,6 +568,17 @@ class CanvasApp:
         self._shape_drag: tuple[int, int] | None = None
         self._shape_end: tuple[int, int] | None = None
         self._preview_pixels: dict[tuple[int, int], Color] = {}
+
+        # In-progress text entry: the insertion point, the x every new line
+        # starts at, the glyphs typed so far (for backspace) and each changed
+        # pixel's pre-edit colour (for Escape's whole-session undo). Empty until
+        # the text tool is clicked on the canvas.
+        self._text_active = False
+        self._text_x = 0
+        self._text_y = 0
+        self._text_line_start_x = 0
+        self._text_history: list[dict[str, Any]] = []
+        self._text_undo: dict[tuple[int, int], Color] = {}
 
         self._sock: socket.socket | None = None
         self._quit = threading.Event()
@@ -1126,6 +1316,20 @@ class CanvasApp:
         """
         return self._paint(self._cursor_x, self._cursor_y, self._brush_color())
 
+    def _flood_fill(self, x: int, y: int) -> list[dict[str, Any]]:
+        """Paint the connected same-colour region at (x, y) with the current
+        color, returned as ONE batch of changes (a single canvas update)."""
+        if not (0 <= x < self._width and 0 <= y < self._height):
+            return []
+        if self._pixels[y][x] == self._color:
+            return []  # the region is already the fill colour: a no-op
+        changes: list[dict[str, Any]] = []
+        for cx, cy in flood_fill_region(self._pixels, x, y):
+            change = self._paint_pixel(cx, cy, self._color)
+            if change is not None:
+                changes.append(change)
+        return changes
+
     def _erase(self) -> list[dict[str, Any]]:
         return self._paint(self._cursor_x, self._cursor_y, self._background)
 
@@ -1166,6 +1370,7 @@ class CanvasApp:
         return self._paint_at_cursor()
 
     def _set_tool(self, tool: str) -> list[dict[str, Any]]:
+        self._text_finalize()  # switching tools commits any in-progress text
         self._tool = tool
         self._pending_chrome = True
         return []
@@ -1191,6 +1396,12 @@ class CanvasApp:
 
     def _tool_line(self) -> list[dict[str, Any]]:
         return self._set_tool(TOOL_LINE)
+
+    def _tool_fill(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_FILL)
+
+    def _tool_text(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_TEXT)
 
     # -- shape drag state machine ---------------------------------------------
 
@@ -1257,6 +1468,137 @@ class CanvasApp:
         self._pending_chrome = False  # force a full canvas redraw (not just chrome)
         self._draw()
 
+    # -- text tool state machine -------------------------------------------
+    #
+    # Selecting the text tool and clicking the canvas starts a text session at
+    # that pixel. Each character typed is drawn immediately (and sent to the
+    # server like any other edit), backspace erases the last character, Enter
+    # starts a new line below, and Escape reverts EVERYTHING drawn during the
+    # session (tracked in ``_text_undo``). Clicking elsewhere or switching tools
+    # finalizes the text — nothing more can be reverted after that.
+
+    def _text_place(self, x: int, y: int) -> list[dict[str, Any]]:
+        """Start a text session at (x, y); a previous session is finalized."""
+        self._text_finalize()
+        self._text_active = True
+        self._text_x = x
+        self._text_y = y
+        self._text_line_start_x = x
+        self._text_history = []
+        self._text_undo = {}
+        self._cursor_x = x
+        self._cursor_y = y
+        self._pending_chrome = True
+        return []
+
+    def _text_type_char(self, ch: str) -> list[dict[str, Any]]:
+        """Route one keystroke while a text session is active."""
+        if ch in ("\r", "\n"):
+            return self._text_newline()
+        if ch in ("\x7f", "\x08"):  # backspace
+            return self._text_backspace()
+        if ch == "\t":
+            return []  # tab does nothing mid-text
+        if ch == " ":
+            return self._text_draw_space()
+        if ch not in _FONT5X7:
+            return []  # unsupported character: ignored
+        return self._text_draw_glyph(ch)
+
+    def _text_draw_glyph(self, ch: str) -> list[dict[str, Any]]:
+        """Draw one glyph at the insertion point and advance right.
+
+        If the glyph's 5x7 box would not fit on the canvas the character is
+        simply not accepted (the user can press Enter to drop a line). The
+        pre-edit colour of every pixel we actually change is remembered in
+        ``_text_undo`` so Escape can revert the whole session.
+        """
+        if self._text_x + FONT_W > self._width or self._text_y + FONT_H > self._height:
+            return []  # out of bounds: stop accepting characters
+        changes: list[dict[str, Any]] = []
+        glyph_pixels_drawn: list[tuple[int, int]] = []
+        for px, py in glyph_pixels(ch, self._text_x, self._text_y):
+            old = self._pixels[py][px]
+            if old == self._color:
+                continue  # already this colour: nothing to draw or undo
+            if (px, py) not in self._text_undo:
+                self._text_undo[(px, py)] = old
+            self._pixels[py][px] = self._color
+            changes.append({"x": px, "y": py, "color": list(self._color)})
+            glyph_pixels_drawn.append((px, py))
+        self._text_history.append(
+            {"kind": "glyph", "x": self._text_x, "y": self._text_y,
+             "pixels": glyph_pixels_drawn}
+        )
+        self._text_x += FONT_W + FONT_SPACING
+        self._sync_text_caret()
+        return changes
+
+    def _text_draw_space(self) -> list[dict[str, Any]]:
+        """A space advances the insertion point without drawing any pixels."""
+        self._text_history.append(
+            {"kind": "glyph", "x": self._text_x, "y": self._text_y, "pixels": []}
+        )
+        self._text_x += FONT_W + FONT_SPACING
+        self._sync_text_caret()
+        return []
+
+    def _text_newline(self) -> list[dict[str, Any]]:
+        """Commit the current line and move the insertion point below it."""
+        new_y = self._text_y + FONT_H + FONT_LINE_SPACING
+        if new_y + FONT_H > self._height:
+            return []  # no room for another line: ignore Enter
+        self._text_history.append(
+            {"kind": "newline", "x": self._text_x, "y": self._text_y}
+        )
+        self._text_x = self._text_line_start_x
+        self._text_y = new_y
+        self._sync_text_caret()
+        return []
+
+    def _text_backspace(self) -> list[dict[str, Any]]:
+        """Erase the last character (or undo a newline) and step back."""
+        if not self._text_history:
+            return []
+        entry = self._text_history.pop()
+        changes: list[dict[str, Any]] = []
+        if entry["kind"] == "newline":
+            self._text_x, self._text_y = entry["x"], entry["y"]
+        else:
+            for px, py in entry["pixels"]:
+                old = self._text_undo.pop((px, py), None)
+                if old is not None and self._pixels[py][px] != old:
+                    self._pixels[py][px] = old
+                    changes.append({"x": px, "y": py, "color": list(old)})
+            self._text_x, self._text_y = entry["x"], entry["y"]
+        self._sync_text_caret()
+        return changes
+
+    def _text_cancel(self) -> list[dict[str, Any]]:
+        """Escape: revert every pixel drawn during this text session."""
+        if not self._text_active:
+            return []
+        changes: list[dict[str, Any]] = []
+        for (px, py), old in self._text_undo.items():
+            if self._pixels[py][px] != old:
+                self._pixels[py][px] = old
+                changes.append({"x": px, "y": py, "color": list(old)})
+        self._text_active = False
+        self._text_history = []
+        self._text_undo = {}
+        return changes
+
+    def _text_finalize(self) -> None:
+        """Commit any in-progress text: nothing more can be reverted."""
+        self._text_active = False
+        self._text_history = []
+        self._text_undo = {}
+
+    def _sync_text_caret(self) -> None:
+        """Move the canvas cursor to the text insertion point (clamped)."""
+        self._cursor_x = min(self._text_x, max(0, self._width - 1))
+        self._cursor_y = min(self._text_y, max(0, self._height - 1))
+
     def _tool_brush_dec(self) -> list[dict[str, Any]]:
         return self._set_brush_size(self._brush_size - 1)
 
@@ -1313,17 +1655,19 @@ class CanvasApp:
     def _handle_mouse(
         self, button: int, col: int, row: int, pressed: bool
     ) -> list[dict[str, Any]]:
-        """SGR mouse event: shape-tool button, toolbar button / brush bar,
+        """SGR mouse event: drawing-tool button, toolbar button / brush bar,
         palette swatch, quick-colour swatch, or paint — or a shape drag.
 
         With Paint/Eraser active, a click (or click-drag) on the canvas fills
         both halves of the cell under the cursor with the brush, exactly as
-        before. With a shape tool active, press starts a drag, motion moves the
-        preview's end point, and release commits the shape as a normal edit; a
-        release with no drag in progress is a no-op. Toolbar and swatch clicks
-        act like the matching keyboard shortcut (and leave palette mode,
-        mirroring keyboard behaviour). Any click also cancels an in-progress
-        custom-colour hex input.
+        before. The bucket fill paints the connected same-colour region in one
+        click; the text tool places (or moves) its insertion point. With a shape
+        tool active, press starts a drag, motion moves the preview's end point,
+        and release commits the shape as a normal edit; a release with no drag
+        in progress is a no-op. Toolbar and swatch clicks act like the matching
+        keyboard shortcut (and leave palette mode, mirroring keyboard
+        behaviour). Any click also cancels an in-progress custom-colour hex
+        input, and every non-text press finalizes any in-progress text entry.
         """
         if not pressed:
             return self._commit_shape()  # release: commit any in-progress shape
@@ -1331,6 +1675,17 @@ class CanvasApp:
             self._exit_custom_color()
         if button not in (0, 4, 32, 36):
             return []  # middle/right button, or a stray event
+        # A canvas click with the text tool places the insertion point. That is
+        # the one press that does not finalize text here (any old session is
+        # finalized-and-restarted inside _text_place).
+        hit = self._screen_cell(col, row)
+        if hit is not None and self._tool == TOOL_TEXT:
+            cell_col, display_row = hit
+            if button == 0:
+                return self._text_place(cell_col, display_row * 2)
+            return []  # drag/wheel with the text tool: nothing to do
+        # Every other press finalizes any in-progress text entry.
+        self._text_finalize()
         shape = self._shape_toolbar_geometry()
         if row == shape["row"]:
             for b in shape["buttons"]:
@@ -1375,6 +1730,8 @@ class CanvasApp:
             return []
         cell_col, display_row = hit
         top_y = display_row * 2
+        if self._tool == TOOL_FILL:
+            return self._flood_fill(cell_col, top_y) if button == 0 else []
         if self._tool in SHAPE_TOOLS:
             return self._shape_motion(cell_col, top_y)
         color = self._brush_color()
@@ -1426,6 +1783,8 @@ class CanvasApp:
             elif ch == "\t":
                 self._exit_custom_color()
             return []  # hex mode swallows every other key
+        if self._text_active:
+            return self._text_type_char(ch)  # an active text entry swallows keys
         if ch == "q":
             self._quit.set()
             return []
@@ -1441,6 +1800,8 @@ class CanvasApp:
             self._palette_mode = False  # any other key leaves palette mode
             self._pending_chrome = True
         if ch == " ":
+            if self._tool == TOOL_FILL:
+                return self._flood_fill(self._cursor_x, self._cursor_y)
             return self._paint_at_cursor()
         if ch == "x":
             return self._erase()
@@ -1460,6 +1821,10 @@ class CanvasApp:
             return self._set_tool(TOOL_HOLLOW_SQUARE)
         if ch == "l":
             return self._set_tool(TOOL_LINE)
+        if ch == "b":
+            return self._set_tool(TOOL_FILL)
+        if ch == "t":
+            return self._set_tool(TOOL_TEXT)
         if ch in "+=":
             return self._set_brush_size(self._brush_size + 1)
         if ch in "-_":
@@ -1485,6 +1850,8 @@ class CanvasApp:
         if final in ("A", "B", "C", "D"):
             if self._custom_color_mode:
                 return []  # arrows do nothing mid hex input
+            if self._text_active:
+                return []  # the text caret is driven by typing, not arrows
             dx, dy = {"A": (0, -1), "B": (0, 1), "C": (1, 0), "D": (-1, 0)}[final]
             if self._palette_mode:
                 self._select_color(self._palette_idx + dx + dy * 4)
@@ -1521,6 +1888,8 @@ class CanvasApp:
                 self._exit_custom_color()  # a stray Esc cancels the hex input
             if self._shape_drag is not None:
                 self._cancel_shape_drag()  # a stray Esc cancels an in-progress shape
+            if self._text_active:
+                return self._text_cancel()  # a stray Esc reverts the text session
             return []  # Alt+key or a stray ESC: ignore
         buf = ""
         while True:
