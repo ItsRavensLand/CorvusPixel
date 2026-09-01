@@ -332,7 +332,7 @@ class RendererSink:
         self._snapshot_provider: Callable[[], dict[str, Any]] | None = None
         self._on_edit: Callable[[list[CellChange]], None] | None = None
         self._on_resize: Callable[[int, int], None] | None = None
-        self._on_labels: Callable[[list[Any]], None] | None = None
+        self._on_objects: Callable[[list[Any]], None] | None = None
         self._server: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._reader_threads: set[threading.Thread] = set()
@@ -346,12 +346,12 @@ class RendererSink:
         snapshot_provider: Callable[[], dict[str, Any]],
         on_edit: Callable[[list[CellChange]], None] | None = None,
         on_resize: Callable[[int, int], None] | None = None,
-        on_labels: Callable[[list[Any]], None] | None = None,
+        on_objects: Callable[[list[Any]], None] | None = None,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._on_edit = on_edit
         self._on_resize = on_resize
-        self._on_labels = on_labels
+        self._on_objects = on_objects
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             os.unlink(self._socket_path)  # clear a stale socket from a dead run
@@ -421,8 +421,8 @@ class RendererSink:
                     w, h = message.get("width"), message.get("height")
                     if isinstance(w, int) and isinstance(h, int):
                         self._on_resize(w, h)
-                elif message.get("type") == "labels" and self._on_labels is not None:
-                    self._on_labels(message.get("labels", []))
+                elif message.get("type") == "objects" and self._on_objects is not None:
+                    self._on_objects(message.get("objects", []))
         except OSError:
             pass
         finally:
@@ -494,11 +494,13 @@ class CanvasServer:
         self._lock = threading.RLock()
         self._canvas = PixelCanvas(width, height, background)
         self._sink = RendererSink(socket_path)
-        # Terminal-text label objects shared with canvas windows, in
-        # {"id", "lines": [[row, col, text], ...], "color"} form with
-        # terminal-cell (not pixel) coordinates. Kept in sync with every
-        # connected window and shown by see_canvas().
-        self._labels: list[dict[str, Any]] = []
+        # Stored drawing objects (shapes, fills, pixel-text) and terminal-text
+        # label objects shared with canvas windows, in z-order = list order
+        # (later objects render on top). Each entry is a clean
+        # {"id", "kind", "color": [r,g,b], "data": {...}, "pixels": [[x,y],...]}
+        # dict; labels carry no pixels (they are a terminal overlay). Kept in
+        # sync with every connected window and shown by see_canvas().
+        self._objects: list[dict[str, Any]] = []
 
     def start(self) -> None:
         """Start accepting canvas-window connections (call before ``server.run()``)."""
@@ -506,7 +508,7 @@ class CanvasServer:
             self.snapshot,
             on_edit=self._apply_edits,
             on_resize=self._resize_canvas,
-            on_labels=self._apply_labels,
+            on_objects=self._apply_objects,
         )
 
     def close(self) -> None:
@@ -524,7 +526,7 @@ class CanvasServer:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {**self._canvas.snapshot(), "labels": self._labels}
+            return {**self._canvas.snapshot(), "objects": self._objects}
 
     # -- user input coming back from a canvas window -------------------------
 
@@ -547,39 +549,80 @@ class CanvasServer:
             if (width, height) == (self._canvas.width, self._canvas.height):
                 return
             self._canvas.resize(width, height)
+            self._clip_objects(width, height)
             # Dimensions changed: every window must re-sync from a fresh snapshot.
-            self._sink.push({"type": "full", **self._canvas.snapshot()})
+            self._sink.push({"type": "full", **self.snapshot()})
 
-    def _apply_labels(self, labels: list[Any]) -> None:
-        """Store the label-object list sent by a canvas window and rebroadcast
-        it, so every connected window (and see_canvas) stays in sync."""
+    def _clip_objects(self, width: int, height: int) -> None:
+        """Clip every pixel object's pixels to the new canvas size, dropping
+        objects that no longer have any pixels. Labels (a terminal overlay)
+        keep their terminal positions."""
+        kept: list[dict[str, Any]] = []
+        for obj in self._objects:
+            if obj["kind"] != "label":
+                clipped = [[x, y] for x, y in obj["pixels"]
+                           if 0 <= x < width and 0 <= y < height]
+                if not clipped:
+                    continue
+                obj["pixels"] = clipped
+            kept.append(obj)
+        self._objects = kept
+
+    def _apply_objects(self, objects: list[Any]) -> None:
+        """Store the object list sent by a canvas window and rebroadcast it,
+        so every connected window (and see_canvas) stays in sync."""
         with self._lock:
             cleaned: list[dict[str, Any]] = []
-            for entry in labels:
-                if not (isinstance(entry, dict)
-                        and "id" in entry and "lines" in entry and "color" in entry):
-                    continue
-                oid = entry["id"]
-                if not isinstance(oid, int):
-                    continue
-                try:
-                    rgb = [int(c) for c in entry["color"]]
-                except (TypeError, ValueError):
-                    continue
-                if len(rgb) != 3:
-                    continue
-                lines: list[list[Any]] = []
-                for line in entry["lines"]:
-                    if not (isinstance(line, list) and len(line) == 3):
+            for entry in objects:
+                obj = self._clean_object(entry)
+                if obj is not None:
+                    cleaned.append(obj)
+            self._objects = cleaned
+            self._sink.push({"type": "objects", "objects": self._objects})
+
+    def _clean_object(self, entry: Any) -> dict[str, Any] | None:
+        """Validate one wire object dict, or return None if malformed."""
+        if not (isinstance(entry, dict)
+                and "id" in entry and "kind" in entry
+                and "color" in entry and "data" in entry):
+            return None
+        oid = entry["id"]
+        kind = entry["kind"]
+        if not isinstance(oid, int) or kind not in (
+            "shape", "fill", "text", "label",
+        ):
+            return None
+        try:
+            rgb = [int(c) for c in entry["color"]]
+        except (TypeError, ValueError):
+            return None
+        if len(rgb) != 3:
+            return None
+        data = entry["data"]
+        if not isinstance(data, dict):
+            return None
+        pixels: list[list[int]] = []
+        if kind != "label":
+            for cell in entry.get("pixels", []):
+                if isinstance(cell, (list, tuple)) and len(cell) == 2:
+                    try:
+                        pixels.append([int(cell[0]), int(cell[1])])
+                    except (TypeError, ValueError):
                         continue
-                    row, col, text = line
-                    if not (isinstance(row, int) and isinstance(col, int)
-                            and isinstance(text, str)):
-                        continue
-                    lines.append([row, col, text])
-                cleaned.append({"id": oid, "lines": lines, "color": rgb})
-            self._labels = cleaned
-            self._sink.push({"type": "labels", "labels": self._labels})
+        return {"id": oid, "kind": kind, "color": rgb, "data": data, "pixels": pixels}
+
+    def _composite_pixels(self) -> list[list[Color]]:
+        """The rendered canvas: the base raster with every object's pixels
+        painted on top in z-order (later objects win)."""
+        grid = [list(row) for row in self._canvas._pixels]
+        for obj in self._objects:
+            if obj["kind"] == "label":
+                continue
+            color = tuple(obj["color"])
+            for x, y in obj["pixels"]:
+                if 0 <= x < self._canvas.width and 0 <= y < self._canvas.height:
+                    grid[y][x] = color
+        return grid
 
     # -- the eight tool bodies ----------------------------------------------
 
@@ -588,8 +631,8 @@ class CanvasServer:
             width = max(1, min(width, 100))  # mirror the resize-path bounds
             height = max(1, min(height, 100))
             self._canvas = PixelCanvas(width, height, background)
-            self._labels = []  # a fresh canvas has no label objects
-            self._sink.push({"type": "full", **self._canvas.snapshot()})
+            self._objects = []  # a fresh canvas has no objects
+            self._sink.push({"type": "full", **self.snapshot()})
             return (
                 f"canvas initialized to {width}x{height} "
                 f"with background {hex_str(background)}"
@@ -616,27 +659,65 @@ class CanvasServer:
     def clear(self, color: str) -> str:
         with self._lock:
             rgb = parse_hex(color)
-            self._publish(self._canvas.clear(rgb))
+            if self._objects:
+                # A full clear: wipe the objects too, so a fresh full snapshot
+                # is the only way to sync every window to the blank canvas.
+                self._objects = []
+                self._canvas.clear(rgb)
+                self._sink.push({"type": "full", **self.snapshot()})
+            else:
+                self._publish(self._canvas.clear(rgb))
             return f"canvas cleared to {color}"
 
     def get_canvas(self) -> str:
+        """Full state as JSON — the base raster with every object composited on
+        top in z-order (debugging)."""
         with self._lock:
-            return json.dumps(self._canvas.snapshot())
+            data = self._canvas.snapshot()
+            data["pixels"] = [
+                [list(c) for c in row] for row in self._composite_pixels()
+            ]
+            return json.dumps(data)
 
     def see_canvas(self) -> str:
         """Return a compact, token-cheap view of the canvas for the model."""
         with self._lock:
-            out = compact_view(self._canvas)
-            if self._labels:
-                parts = ["labels (terminal rows/cols):"]
-                for label in self._labels:
-                    for row, col, text in label["lines"]:
-                        parts.append(
-                            f'  label {label["id"]}: row {row}, col {col}: '
-                            f'"{text}" in {hex_str(tuple(label["color"]))}'
-                        )
+            composite = PixelCanvas(
+                self._canvas.width, self._canvas.height, self._canvas.background
+            )
+            composite._pixels = self._composite_pixels()
+            out = compact_view(composite)
+            if self._objects:
+                parts = ["objects:"]
+                for obj in self._objects:
+                    parts.append(self._describe_object(obj))
                 out += "\n" + "\n".join(parts)
             return out
+
+    def _describe_object(self, obj: dict[str, Any]) -> str:
+        """One type-aware line for see_canvas's objects section."""
+        oid = obj["id"]
+        hexc = hex_str(tuple(obj["color"]))
+        kind = obj["kind"]
+        if kind == "shape":
+            d = obj["data"]
+            return (
+                f'  shape {oid}: {d["shape_type"]} '
+                f"({d['x1']},{d['y1']})-({d['x2']},{d['y2']}) in {hexc}"
+            )
+        if kind == "fill":
+            return f"  fill {oid}: {len(obj['pixels'])} pixels in {hexc}"
+        if kind == "text":
+            text = obj["data"].get("text", "").replace("\n", " / ")
+            return f'  text {oid}: "{text}" in {hexc}'
+        # label: one line per label line of terminal text
+        lines = obj["data"].get("lines", [])
+        if not lines:
+            return f"  label {oid}: (empty) in {hexc}"
+        return "  " + ", ".join(
+            f'label {oid}: row {row}, col {col}: "{text}" in {hexc}'
+            for row, col, text in lines
+        )
 
     def draw_default(self) -> str:
         """Draw the built-in smiley on the current canvas."""

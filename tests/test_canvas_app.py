@@ -40,7 +40,7 @@ from canvas_app import (
     TOOL_PAINT,
     TOOL_SELECT,
     TOOL_TEXT,
-    LabelObject,
+    Object,
     SELECTION_COLOR,
     label_border_cells,
     _FONT5X7,
@@ -53,6 +53,7 @@ from canvas_app import (
     hollow_rect_cells,
     label_cells,
     label_hitbox,
+    pixel_bounds,
     square_end,
     thick_line_cells,
 )
@@ -92,6 +93,13 @@ def cell_screen(app: CanvasApp, x: int, dy: int) -> tuple[int, int]:
     """Terminal (1-based col, row) of the top-left of a canvas display cell."""
     l = app._layout_info
     return (l["left_pad"] + x * CELL_W + 1, l["top_pad"] + 3 + dy)
+
+
+def composite_px(app: CanvasApp, x: int, y: int) -> tuple[int, int, int]:
+    """The rendered color of canvas pixel (x, y): the base raster with every
+    object's pixels painted on top in z-order (and an active text session or
+    drag preview composited live)."""
+    return app._render_color(x, y)
 
 
 def palette_swatch_screen(app: CanvasApp, idx: int) -> tuple[int, int]:
@@ -1204,17 +1212,21 @@ def test_filled_rect_drag_preview_then_commit():
     # press at display cell (1,0) -> canvas (1,0): nothing committed, preview on
     assert shape_press(app, 1, 0) == []
     assert app._preview_pixels  # preview is showing
-    assert app._pixels[0][1] == (10, 10, 10)  # canvas untouched during the drag
+    assert composite_px(app, 1, 0) == (10, 10, 10)  # canvas untouched during the drag
     # drag to display cell (2,1) -> canvas (2,2): preview grows, still untouched
     assert shape_drag(app, 2, 1) == []
     assert app._shape_end == (2, 2)
-    assert app._pixels[2][2] == (10, 10, 10)
-    # release commits the 2x2 box at (1..2, 0..2) as a normal edit
+    assert composite_px(app, 2, 2) == (10, 10, 10)
+    # release commits a 2-wide x 3-tall shape object at (1..2, 0..2)
     changes = shape_release(app, 2, 1)
     assert app._preview_pixels == {}
-    assert len(changes) == 6
-    assert app._pixels[0][1] == (255, 0, 0)
-    assert app._pixels[2][2] == (255, 0, 0)
+    assert changes == []  # shapes commit as an object, not per-pixel edits
+    obj = app._objects[-1]
+    assert obj.kind == "shape" and obj.color == (255, 0, 0)
+    assert obj.data["shape_type"] == "filled_rect"
+    assert obj.pixels == {(1, 0), (2, 0), (1, 1), (2, 1), (1, 2), (2, 2)}
+    assert composite_px(app, 1, 0) == (255, 0, 0)
+    assert composite_px(app, 2, 2) == (255, 0, 0)
 
 
 def test_shape_escape_cancels_preview():
@@ -1231,7 +1243,8 @@ def test_shape_escape_cancels_preview():
     assert app._read_escape_sequence() == []
     assert app._preview_pixels == {}
     assert app._shape_drag is None
-    assert app._pixels[0][1] == (10, 10, 10)  # the canvas was never touched
+    assert app._objects == []  # nothing was committed
+    assert composite_px(app, 1, 0) == (10, 10, 10)  # the canvas was never touched
 
 
 def test_hollow_rect_commit_leaves_interior_empty():
@@ -1243,10 +1256,13 @@ def test_hollow_rect_commit_leaves_interior_empty():
     shape_press(app, 0, 0)
     shape_drag(app, 3, 1)
     changes = shape_release(app, 3, 1)
-    assert len(changes) == 10
-    assert app._pixels[0][0] == (0, 255, 0)  # border
-    assert app._pixels[1][1] == (10, 10, 10)  # interior untouched
-    assert app._pixels[1][2] == (10, 10, 10)
+    assert changes == []
+    obj = app._objects[-1]
+    assert obj.kind == "shape" and obj.data["shape_type"] == "hollow_rect"
+    assert len(obj.pixels) == 10  # the ring is 10 cells
+    assert composite_px(app, 0, 0) == (0, 255, 0)  # border
+    assert composite_px(app, 1, 1) == (10, 10, 10)  # interior untouched
+    assert composite_px(app, 2, 1) == (10, 10, 10)
 
 
 def test_filled_square_snaps_to_square():
@@ -1258,7 +1274,9 @@ def test_filled_square_snaps_to_square():
     shape_drag(app, 3, 1)
     assert app._shape_end == (3, 2)  # raw end point
     changes = shape_release(app, 3, 1)
-    assert len(changes) == 16  # 4x4 square, not 4x3
+    assert changes == []
+    assert app._objects[-1].data["shape_type"] == "filled_square"
+    assert len(app._objects[-1].pixels) == 16  # 4x4 square, not 4x3
 
 
 def test_shape_toolbar_right_aligned_and_selects():
@@ -1323,12 +1341,14 @@ def wide_app() -> CanvasApp:
 
 def test_shortcuts_panel_full_grouping_on_wide_terminal():
     app = wide_app()
-    # The quick-colour row leaves a 57-column left margin: all six groups fit,
-    # packed into lines with a short labelled header per group. "a" (label) and
-    # "v" (select) joined the Shapes group, so Other spills onto its own line.
+    # The quick-colour row leaves a 57-column left margin: all seven groups fit,
+    # packed into lines with a short labelled header per group. The Select group
+    # (v · Del · Enter) is its own group and fits on the first line with
+    # Move/Draw/Brush; "v" was removed from Shapes now that Select has its own.
     assert app._shortcuts_panel(avail=57) == [
-        [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−")],
-        [("Shapes", "p·r·o·f·s·l·b·t·a·v"), ("Canvas", "[ ]·{ }·Tab")],
+        [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−"),
+         ("Select", "v·Del·Enter")],
+        [("Shapes", "p·r·o·f·s·l·b·t·a"), ("Canvas", "[ ]·{ }·Tab")],
         [("Other", "c·1-8·q")],
     ]
 
@@ -1437,9 +1457,11 @@ def test_fill_tool_isolated_pixel_only():
     app._pixels[0][2] = (255, 0, 0)  # a lone red pixel, neighbours are background
     app._color = (0, 255, 0)
     col, row = cell_screen(app, 2, 0)  # the cell containing pixel (2,0)
-    assert app._handle_csi(f"<0;{col};{row}", "M") == [
-        {"x": 2, "y": 0, "color": [0, 255, 0]}
-    ]
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    obj = app._objects[-1]
+    assert obj.kind == "fill" and obj.color == (0, 255, 0)
+    assert obj.pixels == {(2, 0)}  # just the lone pixel's same-colour region
+    assert composite_px(app, 2, 0) == (0, 255, 0)
 
 
 def test_fill_tool_fills_whole_canvas():
@@ -1447,9 +1469,11 @@ def test_fill_tool_fills_whole_canvas():
     app._tool = TOOL_FILL
     app._color = (255, 0, 0)
     col, row = cell_screen(app, 0, 0)
-    changes = app._handle_csi(f"<0;{col};{row}", "M")
-    assert len(changes) == 16
-    assert all(p == (255, 0, 0) for row in app._pixels for p in row)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    obj = app._objects[-1]
+    assert obj.kind == "fill" and len(obj.pixels) == 16
+    assert all(composite_px(app, x, y) == (255, 0, 0)
+               for y in range(4) for x in range(4))
 
 
 def test_fill_tool_noop_when_color_matches():
@@ -1458,6 +1482,7 @@ def test_fill_tool_noop_when_color_matches():
     app._color = (10, 10, 10)  # the background colour
     col, row = cell_screen(app, 2, 0)
     assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._objects == []  # no fill object: the region was already the color
     assert all(p == (10, 10, 10) for row in app._pixels for p in row)
 
 
@@ -1468,26 +1493,25 @@ def test_fill_tool_does_not_cross_a_wall():
         app._pixels[2][x] = (255, 0, 0)  # a wall across row 2
     app._color = (0, 255, 0)
     col, row = cell_screen(app, 1, 0)  # click above the wall (pixel (1,0))
-    changes = app._handle_csi(f"<0;{col};{row}", "M")
-    assert {(c["x"], c["y"]) for c in changes} == {
-        (x, y) for x in range(4) for y in range(2)
-    }
-    assert app._pixels[2][0] == (255, 0, 0)  # the wall survives
-    assert app._pixels[3][3] == (10, 10, 10)  # below the wall untouched
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    obj = app._objects[-1]
+    assert obj.kind == "fill" and obj.color == (0, 255, 0)
+    assert obj.pixels == {(x, y) for x in range(4) for y in range(2)}
+    assert composite_px(app, 2, 0) == (0, 255, 0)  # the fill region above the wall
+    assert composite_px(app, 2, 2) == (255, 0, 0)  # the wall survives
+    assert composite_px(app, 3, 3) == (10, 10, 10)  # below the wall untouched
 
 
-def test_fill_tool_sends_single_batched_update():
+def test_fill_tool_sends_single_objects_message():
     app = make_app()
     app._tool = TOOL_FILL
     app._color = (255, 0, 0)
     sent = []
-    app._send_edit = lambda changes: sent.append(changes)
+    app._send_objects = lambda: sent.append(True)
     col, row = cell_screen(app, 0, 0)
-    changes = app._handle_csi(f"<0;{col};{row}", "M")
-    app._after_edit(changes)
-    assert len(changes) == 16  # one flat batch of every pixel
-    assert len(sent) == 1  # exactly one edit message, not one per pixel
-    assert len(sent[0]) == 16
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert len(sent) == 1  # exactly one objects sync, not one edit per pixel
+    assert len(app._objects) == 1
 
 
 def test_fill_drag_does_not_fill():
@@ -1527,9 +1551,10 @@ def test_fill_tool_space_fills_at_cursor():
     app._handle_char("b")
     app._color = (0, 255, 0)
     app._cursor_x, app._cursor_y = 1, 1
-    changes = app._handle_char(" ")
-    assert len(changes) == 16  # the whole background is one region
-    assert app._pixels[3][3] == (0, 255, 0)
+    assert app._handle_char(" ") == []
+    obj = app._objects[-1]
+    assert obj.kind == "fill" and len(obj.pixels) == 16  # one whole-canvas region
+    assert composite_px(app, 3, 3) == (0, 255, 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1602,9 +1627,10 @@ def test_text_typing_draws_and_advances():
     app._tool = TOOL_TEXT
     app._color = (255, 0, 0)
     app._text_place(2, 2)
-    changes = app._handle_char("H")
-    assert changes and all(c["color"] == [255, 0, 0] for c in changes)
-    assert all(c["y"] in range(2, 2 + FONT_H) for c in changes)
+    assert app._handle_char("H") == []  # glyphs accumulate in the session
+    drawn = glyph_pixels("H", 2, 2, 1)
+    assert app._text_session_pixels == drawn
+    assert all(composite_px(app, x, y) == (255, 0, 0) for x, y in drawn)
     assert app._text_x == 2 + FONT_W + 1  # advanced past the 5-wide glyph
     app._handle_char("i")
     assert app._text_x == 2 + 2 * (FONT_W + 1)
@@ -1616,9 +1642,10 @@ def test_text_mouse_click_then_type():
     app._color = (0, 0, 255)
     col, row = cell_screen(app, 0, 0)
     app._handle_csi(f"<0;{col};{row}", "M")  # place at (0,0)
-    changes = app._handle_char("A")
+    assert app._handle_char("A") == []
     # "A" row 0 is ".###." so the lit top-left pixel is (1,0), not (0,0)
-    assert (1, 0) in {(c["x"], c["y"]) for c in changes}
+    assert (1, 0) in app._text_session_pixels
+    assert (0, 0) not in app._text_session_pixels
 
 
 def test_text_backspace_erases_last_char():
@@ -1629,14 +1656,15 @@ def test_text_backspace_erases_last_char():
     app._handle_char("A")
     app._handle_char("B")
     before = app._text_x
-    changes = app._handle_char("\x7f")  # backspace
-    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._handle_char("\x7f") == []  # backspace
     assert app._text_x == before - (FONT_W + 1)  # insertion stepped back
     # "A" row 0 is ".###." so at (1,1) the lit column is x=2 -> pixel (2,1)
-    assert app._pixels[1][2] == (255, 0, 0)  # A is still there
+    assert app._text_session_pixels == glyph_pixels("A", 1, 1, 1)
+    assert composite_px(app, 2, 1) == (255, 0, 0)  # A is still there
     app._handle_char("\x7f")  # backspace again removes A
     assert app._text_x == 1
-    assert app._pixels[1][2] == (10, 10, 10)
+    assert app._text_session_pixels == set()
+    assert composite_px(app, 2, 1) == (10, 10, 10)
 
 
 def test_text_escape_reverts_whole_session():
@@ -1646,10 +1674,11 @@ def test_text_escape_reverts_whole_session():
     app._text_place(2, 2)
     app._handle_char("H")
     app._handle_char("i")
-    changes = app._read_escape_sequence()  # a stray ESC (no CSI) cancels
-    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._read_escape_sequence() == []  # a stray ESC (no CSI) cancels
     assert app._text_active is False
-    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+    assert app._text_session_pixels == set()
+    assert all(composite_px(app, x, y) == (10, 10, 10)
+               for y in range(app._height) for x in range(app._width))
 
 
 def test_text_enter_moves_to_new_line():
@@ -1675,11 +1704,13 @@ def test_text_out_of_bounds_right_edge_stops_accepting():
     app._tool = TOOL_TEXT
     app._color = (255, 0, 0)
     app._text_place(15, 2)  # 15 + FONT_W == 20: exactly fits
-    assert app._handle_char("H")  # fits: drawn
+    assert app._handle_char("H") == []  # fits: drawn
+    assert app._text_session_pixels == glyph_pixels("H", 15, 2, 1)
     assert app._text_x == 15 + FONT_W + 1
     assert app._handle_char("I") == []  # would overflow: not accepted
     assert app._text_x == 15 + FONT_W + 1  # did not advance
-    assert all(p == (10, 10, 10) for p in app._pixels[2][20:])  # nothing past
+    assert app._text_session_pixels == glyph_pixels("H", 15, 2, 1)  # only the H
+    assert all(composite_px(app, x, 2) == (10, 10, 10) for x in range(20, app._width))
 
 
 def test_text_switching_tool_finalizes_and_commits():
@@ -1695,7 +1726,8 @@ def test_text_switching_tool_finalizes_and_commits():
     app._handle_csi(f"<0;{b.col};{b.row}", "M")  # switch tool via the mouse
     assert app._tool == TOOL_FILLED_RECT
     assert app._text_active is False  # finalized: nothing more to revert
-    assert app._pixels[2][2] == (255, 0, 0)  # the typed text stays committed
+    assert app._objects[-1].kind == "text"  # committed as a text object
+    assert composite_px(app, 2, 2) == (255, 0, 0)  # the typed text stays committed
 
 
 def test_text_click_elsewhere_starts_a_fresh_session():
@@ -1708,11 +1740,12 @@ def test_text_click_elsewhere_starts_a_fresh_session():
     app._handle_csi(f"<0;{col};{row}", "M")
     assert app._text_active is True
     assert (app._text_x, app._text_y) == (1, 10)
-    assert app._pixels[2][2] == (255, 0, 0)  # the old text is committed
+    assert app._objects[-1].kind == "text"  # the old session committed
+    assert composite_px(app, 2, 2) == (255, 0, 0)  # the old text is committed
     app._handle_char("E")
     app._read_escape_sequence()  # Escape only reverts the NEW session
-    assert app._pixels[2][2] == (255, 0, 0)  # old H remains
-    assert app._pixels[10][1] == (10, 10, 10)  # new E reverted
+    assert composite_px(app, 2, 2) == (255, 0, 0)  # old H remains
+    assert composite_px(app, 1, 10) == (10, 10, 10)  # new E reverted
 
 
 def test_text_space_advances_without_drawing():
@@ -1734,20 +1767,22 @@ def test_text_punctuation_renders():
     for ch in ".,!?-()":
         assert glyph_pixels(ch, 0, 0)  # every punctuation glyph has pixels
     app._text_place(0, 0)
-    assert app._handle_char("!")  # '!' draws
+    assert app._handle_char("!") == []
+    assert app._text_session_pixels  # '!' drew pixels into the session
 
 
-def test_text_changes_are_sent_as_normal_edits():
+def test_text_changes_are_sent_as_one_object_sync():
     app = text_app()
     app._tool = TOOL_TEXT
     app._color = (255, 0, 0)
     app._text_place(0, 0)
     sent = []
-    app._send_edit = lambda changes: sent.append(changes)
-    changes = app._handle_char("H")
-    app._after_edit(changes)
-    assert len(sent) == 1
-    assert all({"x", "y", "color"} <= set(c) for c in sent[0])  # server-ready dicts
+    app._send_objects = lambda: sent.append(True)
+    app._handle_char("H")
+    app._text_finalize()
+    assert len(sent) == 1  # one objects sync at finalize, not per-pixel edits
+    assert app._objects[-1].kind == "text"
+    assert app._objects[-1].pixels == glyph_pixels("H", 0, 0, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -1792,13 +1827,13 @@ def test_text_scaled_typing_draws_blocks_and_advances_scaled():
     app._color = (255, 0, 0)
     app._text_scale = 2
     app._text_place(2, 2)
-    changes = app._handle_char("H")
-    drawn = {(c["x"], c["y"]) for c in changes}
+    assert app._handle_char("H") == []
+    drawn = app._text_session_pixels
     assert drawn == glyph_pixels("H", 2, 2, 2)  # exactly the scaled block pixels
-    assert len(changes) == len(glyph_pixels("H", 0, 0, 1)) * 4  # 4x the native
+    assert len(drawn) == len(glyph_pixels("H", 0, 0, 1)) * 4  # 4x the native
     # every block is fully filled: both columns of a lit font pixel lit up
-    assert app._pixels[2][2] == (255, 0, 0) and app._pixels[2][3] == (255, 0, 0)
-    assert app._pixels[3][2] == (255, 0, 0) and app._pixels[3][3] == (255, 0, 0)
+    assert composite_px(app, 2, 2) == (255, 0, 0) and composite_px(app, 2, 3) == (255, 0, 0)
+    assert composite_px(app, 3, 2) == (255, 0, 0) and composite_px(app, 3, 3) == (255, 0, 0)
     # insertion point advanced by the scaled glyph width + scaled spacing
     assert app._text_x == 2 + (FONT_W + FONT_SPACING) * 2
 
@@ -1816,14 +1851,14 @@ def test_text_mixed_scale_renders_without_rescaling_earlier_chars():
     assert app._text_x == (FONT_W + FONT_SPACING) + (FONT_W + FONT_SPACING) * 2
     # the earlier "H" was NOT retroactively rescaled: its pixels are the native
     # single-pixel rows (H row 0 "#...#" -> lit at x 0 and 4), still there
-    assert app._pixels[0][0] == (255, 0, 0)  # H at scale 1, left bar
-    assert app._pixels[0][4] == (255, 0, 0)  # H at scale 1, right bar
-    assert app._pixels[0][5] == (10, 10, 10)  # the spacing column is off
+    assert composite_px(app, 0, 0) == (255, 0, 0)  # H at scale 1, left bar
+    assert composite_px(app, 4, 0) == (255, 0, 0)  # H at scale 1, right bar
+    assert composite_px(app, 5, 0) == (10, 10, 10)  # the spacing column is off
     # the later "I" at scale 2 starts at x=6: its row-0 blocks are at 8..13
     for x in range(8, 14):
-        assert app._pixels[0][x] == (255, 0, 0)
-        assert app._pixels[1][x] == (255, 0, 0)
-    assert app._pixels[0][6] == (10, 10, 10)  # the scaled box leaves no gap
+        assert composite_px(app, x, 0) == (255, 0, 0)
+        assert composite_px(app, x, 1) == (255, 0, 0)
+    assert composite_px(app, 6, 0) == (10, 10, 10)  # the scaled box leaves no gap
 
 
 def test_text_mixed_scale_backspace_removes_exact_characters():
@@ -1836,17 +1871,16 @@ def test_text_mixed_scale_backspace_removes_exact_characters():
     app._text_scale = 2
     app._handle_char("I")
     # backspace erases the scale-2 "I" exactly, leaving the scale-1 "H" intact
-    changes = app._handle_char("\x7f")
-    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._handle_char("\x7f") == []
     assert app._text_x == FONT_W + FONT_SPACING  # back to just after the H
     for px in glyph_pixels("I", FONT_W + FONT_SPACING, 0, 2):
-        assert app._pixels[px[1]][px[0]] == (10, 10, 10)
+        assert composite_px(app, px[0], px[1]) == (10, 10, 10)
     for px in glyph_pixels("H", 0, 0, 1):
-        assert app._pixels[px[1]][px[0]] == (255, 0, 0)
+        assert composite_px(app, px[0], px[1]) == (255, 0, 0)
     # a second backspace removes the scale-1 "H"
     app._handle_char("\x7f")
     assert app._text_x == 0
-    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+    assert app._text_session_pixels == set()
 
 
 def test_text_escape_reverts_scaled_session():
@@ -1857,10 +1891,11 @@ def test_text_escape_reverts_scaled_session():
     app._text_place(1, 1)
     app._handle_char("A")
     app._handle_char("B")
-    changes = app._read_escape_sequence()  # a stray ESC (no CSI) cancels
-    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._read_escape_sequence() == []  # a stray ESC (no CSI) cancels
     assert app._text_active is False
-    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+    assert app._text_session_pixels == set()
+    assert all(composite_px(app, x, y) == (10, 10, 10)
+               for y in range(app._height) for x in range(app._width))
 
 
 def test_text_scale_newline_drops_scaled_height():
@@ -1888,12 +1923,13 @@ def test_text_scaled_glyph_refused_at_right_edge():
     app._tool = TOOL_TEXT
     app._color = (255, 0, 0)
     app._text_place(15, 2)
-    assert app._handle_char("H")  # native 5 wide: 15 + 5 == 20 fits
+    assert app._handle_char("H") == []  # native 5 wide: 15 + 5 == 20 fits
     assert app._text_x == 15 + FONT_W + FONT_SPACING
     app._text_scale = 2  # now the box is 10 wide: 21 + 10 > 20 -> refused
     assert app._handle_char("I") == []
     assert app._text_x == 15 + FONT_W + FONT_SPACING  # did not advance
-    assert all(p == (10, 10, 10) for p in app._pixels[2][21:])  # nothing past
+    assert app._text_session_pixels == glyph_pixels("H", 15, 2, 1)  # only the H
+    assert all(composite_px(app, x, 2) == (10, 10, 10) for x in range(20, app._width))
 
 
 def test_text_scaled_glyph_refused_at_bottom_edge():
@@ -1946,9 +1982,10 @@ def test_slider_click_mid_typing_keeps_the_session_live():
     assert app._text_active is True
     app._handle_char("I")
     # Escape still reverts the WHOLE mixed-scale session
-    changes = app._read_escape_sequence()
-    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
-    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+    assert app._read_escape_sequence() == []
+    assert app._text_session_pixels == set()
+    assert all(composite_px(app, x, y) == (10, 10, 10)
+               for y in range(app._height) for x in range(app._width))
 
 
 def test_plus_minus_keys_set_text_scale_when_text_active():
@@ -1983,13 +2020,13 @@ def test_plus_minus_keys_work_mid_typing():
     app._handle_char("I")
     assert app._text_x == (FONT_W + FONT_SPACING) + (FONT_W + FONT_SPACING) * 2
     # the H stayed at its original scale
-    assert app._pixels[0][0] == (255, 0, 0)
+    assert composite_px(app, 0, 0) == (255, 0, 0)
     # backspace removes the scale-2 I, then the scale-1 H
     app._handle_char("\x7f")
     assert app._text_x == FONT_W + FONT_SPACING
     app._handle_char("\x7f")
     assert app._text_x == 0
-    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+    assert app._text_session_pixels == set()
 
 
 def test_status_line_shows_text_size_when_text_active():
@@ -2027,12 +2064,12 @@ def label_screen(app: CanvasApp, trow: int, tcol: int) -> tuple[int, int]:
 
 def test_label_cells_expands_object():
     """A stored label object expands into one overlay cell per character."""
-    obj = LabelObject(1, [(0, 2, "Hi")], (255, 0, 0))
+    obj = Object(1, "label", (255, 0, 0), {"lines": [(0, 2, "Hi")]})
     assert label_cells(obj) == {
         (0, 2): ("H", (255, 0, 0)),
         (0, 3): ("i", (255, 0, 0)),
     }
-    multi = LabelObject(2, [(1, 1, "ab"), (3, 5, "x")], (0, 0, 255))
+    multi = Object(2, "label", (0, 0, 255), {"lines": [(1, 1, "ab"), (3, 5, "x")]})
     assert label_cells(multi) == {
         (1, 1): ("a", (0, 0, 255)),
         (1, 2): ("b", (0, 0, 255)),
@@ -2042,10 +2079,10 @@ def test_label_cells_expands_object():
 
 def test_label_hitbox_single_and_multi_line():
     """The hitbox is the bounding rectangle over every rendered character."""
-    assert label_hitbox(LabelObject(1, [(0, 2, "Hi")], (255, 0, 0))) == (0, 2, 0, 3)
-    obj = LabelObject(2, [(1, 1, "abc"), (3, 5, "xy")], (255, 0, 0))
+    assert label_hitbox(Object(1, "label", (255, 0, 0), {"lines": [(0, 2, "Hi")]})) == (0, 2, 0, 3)
+    obj = Object(2, "label", (255, 0, 0), {"lines": [(1, 1, "abc"), (3, 5, "xy")]})
     assert label_hitbox(obj) == (1, 1, 3, 6)  # rows 1..3, cols 1..6
-    assert label_hitbox(LabelObject(3, [], (255, 0, 0))) is None
+    assert label_hitbox(Object(3, "label", (255, 0, 0), {"lines": []})) is None
 
 
 def test_label_border_cells_rings_the_hitbox():
@@ -2135,10 +2172,10 @@ def test_label_backspace_empty_session_is_noop():
     app._label_place(0, 1)
     app._handle_char("H")
     app._label_finalize()
-    assert app._labels == [LabelObject(1, [(0, 1, "H")], (255, 0, 0))]
+    assert app._objects == [Object(1, "label", (255, 0, 0), {"lines": [(0, 1, "H")]})]
     app._label_place(0, 2)  # a fresh session right after the char
     assert app._handle_char("\x7f") == []
-    assert app._labels == [LabelObject(1, [(0, 1, "H")], (255, 0, 0))]
+    assert app._objects == [Object(1, "label", (255, 0, 0), {"lines": [(0, 1, "H")]})]
 
 
 def test_label_enter_new_line():
@@ -2158,7 +2195,7 @@ def test_label_escape_cancels_session():
     app._read_escape_sequence()  # a stray ESC (no CSI) cancels the session
     assert app._label_active is False
     assert app._label_session_cells == {}
-    assert app._labels == []  # nothing committed
+    assert app._objects == []  # nothing committed
 
 
 def test_label_finalize_commits():
@@ -2169,8 +2206,8 @@ def test_label_finalize_commits():
     app._handle_char("i")
     app._label_finalize()
     assert app._label_active is False
-    assert app._labels == [LabelObject(1, [(0, 0, "Hi")], (255, 0, 0))]
-    assert app._label_next_id == 2  # the next fresh session gets a new id
+    assert app._objects == [Object(1, "label", (255, 0, 0), {"lines": [(0, 0, "Hi")]})]
+    assert app._object_next_id == 2  # the next fresh session gets a new id
 
 
 def test_label_right_edge_stops():
@@ -2202,7 +2239,7 @@ def test_label_tool_switch_finalizes():
     app._handle_csi(f"<0;{b.col};{b.row}", "M")  # switch tool via the mouse
     assert app._tool == TOOL_FILLED_RECT
     assert app._label_active is False  # finalized into a stored object
-    assert app._labels == [LabelObject(1, [(0, 0, "Hp")], (255, 0, 0))]
+    assert app._objects == [Object(1, "label", (255, 0, 0), {"lines": [(0, 0, "Hp")]})]
 
 
 def test_label_char_overwrites_pixel_block():
@@ -2236,7 +2273,7 @@ def test_label_removal_restores_pixel_cell():
     app._label_place(0, 0)
     app._handle_char("X")
     app._label_finalize()
-    assert app._labels == [LabelObject(1, [(0, 0, "X")], (0, 0, 255))]
+    assert app._objects == [Object(1, "label", (0, 0, 255), {"lines": [(0, 0, "X")]})]
     app._draw()
     baseline = app._console.file.getvalue()
     l = app._layout_info
@@ -2246,9 +2283,9 @@ def test_label_removal_restores_pixel_cell():
     app._tool = TOOL_SELECT
     col, row = label_screen(app, 0, 0)
     app._handle_csi(f"<0;{col};{row}", "M")
-    assert app._selected_label_id == 1
+    assert app._selected_id == 1
     assert app._handle_char("\x7f") == []
-    assert app._labels == []  # the object is gone entirely
+    assert app._objects == []  # the object is gone entirely
     app._draw()
     delta = app._console.file.getvalue()[len(baseline):]
     assert pos in delta  # the pixel cell is rewritten
@@ -2256,75 +2293,79 @@ def test_label_removal_restores_pixel_cell():
     assert "X" not in delta  # the label char is gone
 
 
-def test_app_apply_labels_message_replaces_objects():
-    """A server labels broadcast replaces the whole object store (another
+def test_app_apply_objects_message_replaces_store():
+    """A server objects broadcast replaces the whole object store (another
     window), bumps the id counter, and clears a selection that vanished."""
     app = text_app()
-    app._labels = [LabelObject(1, [(1, 2, "Hi")], (255, 0, 0))]
-    app._label_next_id = 2
-    app._selected_label_id = 1
+    app._objects = [Object(1, "label", (255, 0, 0), {"lines": [(1, 2, "Hi")]})]
+    app._object_next_id = 2
+    app._selected_id = 1
     app._apply({
-        "type": "labels",
-        "labels": [{"id": 7, "lines": [[0, 2, "AB"], [2, 0, "z"]],
-                    "color": [0, 0, 255]}],
+        "type": "objects",
+        "objects": [{
+            "id": 7, "kind": "label", "color": [0, 0, 255],
+            "data": {"lines": [[0, 2, "AB"], [2, 0, "z"]]}, "pixels": [],
+        }],
     })
-    assert [o.label_id for o in app._labels] == [7]
-    assert app._labels[0].lines == [(0, 2, "AB"), (2, 0, "z")]
-    assert app._labels[0].color == (0, 0, 255)
-    assert app._selected_label_id is None  # id 1 no longer exists
-    assert app._label_next_id == 8  # future ids stay ahead of what we received
+    assert [o.oid for o in app._objects] == [7]
+    assert app._objects[0].data["lines"] == [[0, 2, "AB"], [2, 0, "z"]]
+    assert app._objects[0].color == (0, 0, 255)
+    assert app._selected_id is None  # id 1 no longer exists
+    assert app._object_next_id == 8  # future ids stay ahead of what we received
 
 
-def test_label_wire_reflects_objects():
-    """The wire representation is the object model, one dict per label."""
+def test_object_wire_reflects_store():
+    """The wire representation is the object model, one dict per object."""
     app = label_select_app()
-    assert app._label_wire() == [
-        {"id": 1, "lines": [[1, 2, "Hi"]], "color": [255, 0, 0]},
-        {"id": 2, "lines": [[4, 5, "yo"]], "color": [0, 255, 0]},
+    assert app._object_wire() == [
+        {"id": 1, "kind": "label", "color": [255, 0, 0],
+         "data": {"lines": [(1, 2, "Hi")]}, "pixels": []},
+        {"id": 2, "kind": "label", "color": [0, 255, 0],
+         "data": {"lines": [(4, 5, "yo")]}, "pixels": []},
     ]
 
 
 # --------------------------------------------------------------------------- #
-# Select tool: clicking, moving, deleting and editing label objects
+# Select tool: clicking, moving, deleting and editing objects (labels here)
 # --------------------------------------------------------------------------- #
 
 
 def label_select_app() -> CanvasApp:
     """A text_app with two stored label objects and the select tool active."""
     app = text_app()
-    app._labels = [
-        LabelObject(1, [(1, 2, "Hi")], (255, 0, 0)),
-        LabelObject(2, [(4, 5, "yo")], (0, 255, 0)),
+    app._objects = [
+        Object(1, "label", (255, 0, 0), {"lines": [(1, 2, "Hi")]}),
+        Object(2, "label", (0, 255, 0), {"lines": [(4, 5, "yo")]}),
     ]
-    app._label_next_id = 3
-    app._last_label_wire = app._label_wire()
+    app._object_next_id = 3
+    app._last_objects_wire = app._object_wire()
     app._tool = TOOL_SELECT
     return app
 
 
-def test_label_at_finds_topmost_hitbox():
+def test_object_at_finds_topmost_hitbox():
     app = label_select_app()
-    assert app._label_at(1, 3).label_id == 1  # inside "Hi"
-    assert app._label_at(4, 5).label_id == 2  # inside "yo"
-    assert app._label_at(0, 0) is None  # empty space
+    assert app._object_at(1, 3).oid == 1  # inside "Hi"
+    assert app._object_at(4, 5).oid == 2  # inside "yo"
+    assert app._object_at(0, 0) is None  # empty space
     # overlapping labels: the later one (drawn on top) wins
-    app._labels.append(LabelObject(3, [(1, 3, "!!")], (0, 0, 255)))
-    assert app._label_at(1, 3).label_id == 3
+    app._objects.append(Object(3, "label", (0, 0, 255), {"lines": [(1, 3, "!!")]}))
+    assert app._object_at(1, 3).oid == 3
 
 
 def test_select_tool_click_selects_switches_and_deselects():
     app = label_select_app()
     col, row = label_screen(app, 1, 3)  # inside "Hi"
     assert app._handle_csi(f"<0;{col};{row}", "M") == []
-    assert app._selected_label_id == 1
+    assert app._selected_id == 1
     # clicking the other label switches the selection
     col, row = label_screen(app, 4, 6)  # inside "yo"
     assert app._handle_csi(f"<0;{col};{row}", "M") == []
-    assert app._selected_label_id == 2
+    assert app._selected_id == 2
     # clicking empty canvas space deselects
     col, row = label_screen(app, 0, 30)  # inside the canvas, far from both
     assert app._handle_csi(f"<0;{col};{row}", "M") == []
-    assert app._selected_label_id is None
+    assert app._selected_id is None
 
 
 def test_select_tool_only_one_selected_at_a_time():
@@ -2332,9 +2373,8 @@ def test_select_tool_only_one_selected_at_a_time():
     for trow, tcol in [(1, 2), (4, 5), (1, 3), (4, 6)]:
         col, row = label_screen(app, trow, tcol)
         app._handle_csi(f"<0;{col};{row}", "M")
-        assert app._selected_label_id in (1, 2)  # always exactly one
-    matched = [o.label_id for o in app._labels
-               if o.label_id == app._selected_label_id]
+        assert app._selected_id in (1, 2)  # always exactly one
+    matched = [o.oid for o in app._objects if o.oid == app._selected_id]
     assert matched == [2]
 
 
@@ -2365,21 +2405,21 @@ def test_select_tool_drag_moves_label_with_preview_and_commit():
     # offset is (0,0) and the label follows the cursor exactly
     col, row = label_screen(app, 1, 2)
     assert app._handle_csi(f"<0;{col};{row}", "M") == []
-    assert app._label_drag_id == 1
+    assert app._drag_id == 1
     # motion to (3,5): a dimmed preview moves there, the stored object untouched
     col, row = label_screen(app, 3, 5)
     assert app._handle_csi(f"<32;{col};{row}", "M") == []
     assert app._label_drag_preview is not None
-    assert app._label_drag_preview.lines == [(3, 5, "Hi")]
-    assert app._labels[0].lines == [(1, 2, "Hi")]
+    assert app._label_drag_preview.data["lines"] == [(3, 5, "Hi")]
+    assert app._objects[0].data["lines"] == [(1, 2, "Hi")]
     app._draw()
     delta = app._console.file.getvalue()[len(baseline):]
     assert "\x1b[38;2;102;0;0m" in delta  # 40% of (255,0,0) preview dim
     # release commits the move
     assert app._handle_csi(f"<0;{col};{row}", "m") == []
-    assert app._labels[0].lines == [(3, 5, "Hi")]
+    assert app._objects[0].data["lines"] == [(3, 5, "Hi")]
     assert app._label_drag_preview is None
-    assert app._selected_label_id == 1
+    assert app._selected_id == 1
 
 
 def test_select_tool_drag_clamps_to_canvas():
@@ -2390,7 +2430,7 @@ def test_select_tool_drag_clamps_to_canvas():
     col, row = label_screen(app, 7, 79)  # the last terminal row/column
     app._handle_csi(f"<32;{col};{row}", "M")
     layout = app._compute_layout()
-    assert app._label_drag_preview.lines == [
+    assert app._label_drag_preview.data["lines"] == [
         (layout["canvas_rows"] - 1, app._width * CELL_W - 2, "Hi")
     ]
 
@@ -2399,12 +2439,12 @@ def test_select_tool_delete_removes_label_object():
     app = label_select_app()
     col, row = label_screen(app, 1, 2)
     app._handle_csi(f"<0;{col};{row}", "M")
-    assert app._selected_label_id == 1
+    assert app._selected_id == 1
     assert app._handle_char("\x7f") == []  # Delete/Backspace removes the object
-    assert [o.label_id for o in app._labels] == [2]
-    assert app._selected_label_id is None
+    assert [o.oid for o in app._objects] == [2]
+    assert app._selected_id is None
     assert app._handle_char("\x7f") == []  # nothing selected: no-op
-    assert [o.label_id for o in app._labels] == [2]
+    assert [o.oid for o in app._objects] == [2]
 
 
 def test_select_tool_enter_edits_in_place_escape_reverts():
@@ -2417,11 +2457,11 @@ def test_select_tool_enter_edits_in_place_escape_reverts():
     assert (app._label_row, app._label_col) == (1, 4)  # caret at the end of "Hi"
     app._handle_char("!")
     assert app._label_session_cells[(1, 4)] == ("!", (255, 0, 0))
-    assert app._labels[0].lines == [(1, 2, "Hi")]  # stored object untouched
+    assert app._objects[0].data["lines"] == [(1, 2, "Hi")]  # stored object untouched
     app._read_escape_sequence()  # Escape reverts to the pre-edit content
     assert app._label_active is False
     assert app._label_edit_oid is None
-    assert app._labels[0].lines == [(1, 2, "Hi")]
+    assert app._objects[0].data["lines"] == [(1, 2, "Hi")]
     assert app._label_session_cells == {}
 
 
@@ -2433,7 +2473,9 @@ def test_select_tool_edit_finalize_commits_and_empty_removes():
     app._handle_char("\r")
     app._handle_char("!")
     app._label_finalize()
-    assert app._labels[0] == LabelObject(1, [(1, 2, "Hi!")], (255, 0, 0))
+    assert app._objects[0] == Object(
+        1, "label", (255, 0, 0), {"lines": [(1, 2, "Hi!")]},
+    )
     # editing everything away deletes the object
     app._handle_char("\r")  # re-open again
     app._handle_char("\x7f")  # "Hi!" -> "Hi"
@@ -2441,8 +2483,8 @@ def test_select_tool_edit_finalize_commits_and_empty_removes():
     app._handle_char("\x7f")  # "H" -> ""
     assert app._label_session_cells == {}
     app._label_finalize()
-    assert [o.label_id for o in app._labels] == [2]
-    assert app._selected_label_id is None
+    assert [o.oid for o in app._objects] == [2]
+    assert app._selected_id is None
 
 
 def test_selecting_and_deleting_never_touches_pixels():
@@ -2461,3 +2503,156 @@ def test_selecting_and_deleting_never_touches_pixels():
     app._handle_csi(f"<32;{col};{row}", "M")
     app._handle_csi(f"<0;{col};{row}", "m")
     assert app._pixels == pixels_before
+
+
+# --------------------------------------------------------------------------- #
+# Object layering: z-order, move, delete, hitboxes, select-by-click
+# --------------------------------------------------------------------------- #
+
+
+def test_overlapping_shapes_render_in_z_order():
+    """Two overlapping filled rects: the later one renders on top (z-order =
+    creation order), the earlier one shows through everywhere else."""
+    app = text_app()
+    # shape A: red filled rect (0,0)-(3,2)
+    app._color = (255, 0, 0)
+    app._tool = TOOL_FILLED_RECT
+    shape_press(app, 0, 0)
+    shape_drag(app, 3, 1)  # drag to (3,2)
+    shape_release(app, 3, 1)
+    # shape B: green filled rect (2,0)-(5,2), overlapping A in x 2..3
+    app._color = (0, 255, 0)
+    shape_press(app, 2, 0)
+    shape_drag(app, 5, 1)  # drag to (5,2)
+    shape_release(app, 5, 1)
+    assert [o.oid for o in app._objects] == [1, 2]
+    assert app._objects[1].kind == "shape" and app._objects[1].color == (0, 255, 0)
+    # A only: x 0..1
+    assert composite_px(app, 0, 0) == (255, 0, 0)
+    assert composite_px(app, 1, 2) == (255, 0, 0)
+    # B only: x 4..5
+    assert composite_px(app, 4, 0) == (0, 255, 0)
+    assert composite_px(app, 5, 2) == (0, 255, 0)
+    # the overlap (x 2..3) renders B, the later object
+    assert composite_px(app, 2, 1) == (0, 255, 0)
+    assert composite_px(app, 3, 0) == (0, 255, 0)
+
+
+def test_select_move_shape_does_not_corrupt_underlying():
+    """Dragging the top object of an overlap moves only its own pixels: what
+    was underneath (and the base) shows through intact at the old spot."""
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._tool = TOOL_FILLED_RECT
+    shape_press(app, 0, 0)
+    shape_drag(app, 3, 1)
+    shape_release(app, 3, 1)  # A: red (0,0)-(3,2)
+    app._color = (0, 255, 0)
+    shape_press(app, 2, 0)
+    shape_drag(app, 5, 1)
+    shape_release(app, 5, 1)  # B: green (2,0)-(5,2)
+    app._tool = TOOL_SELECT
+    # grab B at pixel (4,1) — its own right half, outside A's box
+    col, row = label_screen(app, 1 // 2, 4 * CELL_W)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._selected_id == 2
+    # drag right by 6 pixels: motion at pixel (10,1) -> terminal cell (0,20)
+    col, row = label_screen(app, 0, 10 * CELL_W)
+    assert app._handle_csi(f"<32;{col};{row}", "M") == []
+    assert app._object_drag_preview == {
+        (x + 6, y) for (x, y) in app._objects[1].pixels
+    }
+    assert app._objects[1].pixels != app._object_drag_preview  # stored, untouched
+    col, row = label_screen(app, 0, 10 * CELL_W)
+    assert app._handle_csi(f"<0;{col};{row}", "m") == []  # release commits
+    moved = app._objects[1]
+    assert moved.kind == "shape" and moved.oid == 2
+    assert pixel_bounds(moved.pixels) == (8, 0, 11, 2)
+    # the moved shape renders at its new spot
+    assert composite_px(app, 10, 1) == (0, 255, 0)
+    assert composite_px(app, 11, 2) == (0, 255, 0)
+    # what was under B is intact: A shows through the old overlap
+    assert composite_px(app, 2, 1) == (255, 0, 0)
+    assert composite_px(app, 3, 0) == (255, 0, 0)
+    # the base is intact where B used to stand alone
+    assert composite_px(app, 4, 0) == (10, 10, 10)
+    assert composite_px(app, 5, 2) == (10, 10, 10)
+    # and A's own pixels never moved
+    assert composite_px(app, 0, 0) == (255, 0, 0)
+    assert composite_px(app, 1, 2) == (255, 0, 0)
+
+
+def test_select_delete_shape_reveals_underlying_and_base():
+    """Deleting the top object of an overlap reveals the lower object where
+    they overlapped and the base raster where it stood alone."""
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._tool = TOOL_FILLED_RECT
+    shape_press(app, 0, 0)
+    shape_drag(app, 3, 1)
+    shape_release(app, 3, 1)  # A: red (0,0)-(3,2)
+    app._color = (0, 255, 0)
+    shape_press(app, 2, 0)
+    shape_drag(app, 5, 1)
+    shape_release(app, 5, 1)  # B: green (2,0)-(5,2)
+    app._tool = TOOL_SELECT
+    col, row = label_screen(app, 0, 4 * CELL_W)  # B-only pixel (4,0)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_id == 2
+    assert app._handle_char("\x7f") == []
+    assert [o.oid for o in app._objects] == [1]
+    assert app._selected_id is None
+    # the overlap reverts to A
+    assert composite_px(app, 2, 1) == (255, 0, 0)
+    assert composite_px(app, 3, 0) == (255, 0, 0)
+    # the B-only area reverts to the base raster
+    assert composite_px(app, 4, 0) == (10, 10, 10)
+    assert composite_px(app, 5, 2) == (10, 10, 10)
+    # A itself is untouched
+    assert composite_px(app, 0, 0) == (255, 0, 0)
+
+
+def test_object_hitbox_per_type():
+    """Each object kind computes its terminal-cell hitbox from its own shape:
+    labels from their text cells, pixel objects from their pixel bounds."""
+    app = make_app()
+    shape = Object(1, "shape", (255, 0, 0),
+                   {"shape_type": "filled_rect", "x1": 0, "y1": 0,
+                    "x2": 2, "y2": 1, "thickness": 1},
+                   {(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)})
+    assert app._object_hitbox(shape) == (0, 0, 0, 5)  # pixels row 0..1 -> display 0
+    fill = Object(2, "fill", (0, 255, 0), {"pixel_count": 2}, {(3, 3), (3, 4)})
+    assert app._object_hitbox(fill) == (1, 6, 2, 7)  # pixel row 3..4 -> display 1..2
+    text = Object(3, "text", (0, 0, 255), {"text": "A"}, {(0, 0), (1, 0)})
+    assert app._object_hitbox(text) == (0, 0, 0, 3)
+    label = Object(4, "label", (255, 255, 255), {"lines": [(0, 2, "Hi")]})
+    assert app._object_hitbox(label) == (0, 2, 0, 3)
+
+
+def test_select_tool_click_selects_shape_fill_and_text():
+    """The select tool picks any object kind by clicking inside its hitbox."""
+    app = text_app()  # 40x16: every object's hitbox fits the visible canvas
+    app._tool = TOOL_SELECT
+    app._objects = [
+        Object(1, "shape", (255, 0, 0), {"shape_type": "filled_rect"},
+               {(0, 0), (1, 0), (0, 1), (1, 1)}),            # pixels (0,0)-(1,1)
+        Object(2, "fill", (0, 255, 0), {"pixel_count": 2}, {(3, 3), (3, 4)}),
+        Object(3, "text", (0, 0, 255), {"text": "A"}, {(2, 0), (3, 0)}),
+    ]
+    app._last_objects_wire = app._object_wire()
+    # click inside the shape at pixel (1,1): terminal cell (0, 2)
+    col, row = label_screen(app, 0, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_id == 1
+    # click inside the fill at pixel (3,4): terminal cell (2, 6)
+    col, row = label_screen(app, 2, 6)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_id == 2
+    # click inside the text at pixel (3,0): terminal cell (0, 6)
+    col, row = label_screen(app, 0, 6)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_id == 3
+    # click empty canvas deselects
+    col, row = label_screen(app, 0, 10)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_id is None

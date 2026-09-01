@@ -63,16 +63,21 @@ session it just says "Canvas already open in this session."
   characters in the terminal's own font — crisp at any size — right over the
   pixel grid in the current color, Backspace removes the last character, Enter
   starts a new line below, Escape cancels the whole in-progress label, and
-  clicking elsewhere or switching tools finalizes it. Every finished label is a
-  single selectable object with its own id, position (per line), text and
-  color; the **select** tool (`v`) clicks inside a label's box to select it (a
-  cyan border wraps the whole thing), click-drags to move it (a dimmed preview
-  follows the cursor; release commits the new position), Delete or Backspace
-  removes it entirely, and Enter re-opens it for in-place editing — cursor at
-  the end of the text, Backspace/typing modify it in place, Escape reverts to
-  the pre-edit content (it never deletes). Only one label is selected at a
-  time, and selection never touches the pixel grid. Labels show up in
-  `see_canvas`.
+  clicking elsewhere or switching tools finalizes it. Every finished
+  **shape**, **bucket fill**, **pixel-art text** session and **label** becomes
+  a single selectable **object** with its own id and colour: shapes, fills and
+  text own the exact canvas pixels they cover, labels own terminal text cells.
+  Objects sit on top of the base raster (freehand paint and eraser), and each is
+  selectable and movable on its own — so moving or deleting one reveals whatever
+  is underneath it, the base or lower objects. The **select** tool (`v`) clicks
+  inside any object's box to select it (a cyan border wraps the shape's bounding
+  box, the fill's extent or the label's text), click-drags to move it (a dimmed
+  preview follows the cursor; release commits the new position), Delete or
+  Backspace removes it entirely, and Enter re-opens text-based objects
+  (pixel-art text and labels) for in-place editing — cursor at the end of the
+  text, Backspace/typing modify it in place, Escape reverts to the pre-edit
+  content (it never deletes). Only one object is selected at a time, and
+  selection never touches the pixel grid. Objects show up in `see_canvas`.
 - **Keyboard**
   - A live reminder of all these shortcuts sits in the bottom-left corner of the
     window, packed into small labelled groups (move / draw / brush / shapes /
@@ -95,9 +100,10 @@ session it just says "Canvas already open in this session."
     `a` — label tool: click to place a terminal-cell caret, type literal
     terminal characters right over the pixels, Backspace removes the last one,
     Enter drops a line, Escape cancels the whole in-progress label ·
-    `v` — select tool: click inside a label to select it (a cyan border wraps
-    its box), drag to move it, Delete/Backspace removes it, Enter re-opens it
-    for in-place editing (Escape reverts)
+    `v` — select tool: click inside any object (shape, fill, pixel-text or
+    label) to select it (a cyan border wraps its box), drag to move it,
+    Delete/Backspace removes it, Enter re-opens text-based objects for in-place
+    editing (Escape reverts)
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
     the toolbar's brush bar does the same with the mouse). With the **text tool
     active** they set the text scale instead (each font pixel draws as an N×N
@@ -138,8 +144,10 @@ If you skip MCP registration:
    (retrying forever), renders the canvas with diff-only truecolor `▀`
    half-blocks, and turns keyboard/mouse input into pixel edits that are applied
    locally and sent back to the server as `{"type": "edit", ...}` (and canvas
-   size changes as `{"type": "resize", ...}`). The server applies them and
-   rebroadcasts.
+   size changes as `{"type": "resize", ...}`). Freehand strokes are the raw
+   pixel edits; finished shapes, fills, text and labels are synced as
+   `{"type": "objects", ...}` carrying the ordered object list. The server
+   applies them and rebroadcasts.
 3. **Session-scoped socket** — the socket path is derived from the server's
    parent PID (the Claude Code session that spawned it), e.g.
    `/tmp/corvuspixel-<ppid>.sock`. A window opened from this session always talks

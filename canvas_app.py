@@ -89,7 +89,7 @@ import termios
 import threading
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from rich.console import Console
@@ -269,7 +269,8 @@ _SHORTCUT_GROUPS: list[tuple[str, list[str]]] = [
     ("Move", ["←↑↓→"]),
     ("Draw", ["space", "x", "e"]),
     ("Brush", ["+", "−"]),
-    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t", "a", "v"]),
+    ("Select", ["v", "Del", "Enter"]),
+    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t", "a"]),
     ("Canvas", ["[ ]", "{ }", "Tab"]),
     ("Other", ["c", "1-8", "q"]),
 ]
@@ -551,27 +552,34 @@ def glyph_pixels(char: str, x: int, y: int, scale: int = 1) -> set[tuple[int, in
 
 
 # --------------------------------------------------------------------------- #
-# Label objects: literal terminal text overlaid on the pixel grid (pure helpers)
+# Objects: shapes, fills, pixel-text and labels share one object model
 # --------------------------------------------------------------------------- #
 
-# Each text-entry session becomes ONE label object: an id, the per-line start
-# (row, col) and text of every line it rendered, and a single colour. The
-# hitbox — the bounding rectangle covering every character cell the label
-# renders — is computed on demand; the select tool uses it for hit-testing,
-# move and delete. Labels are never merged into the pixel grid: the canvas
-# draws as usual and the label characters are overlaid on top, one terminal
-# cell at a time, at whole-terminal-cell resolution. The objects themselves are
-# what sync to the server and what see_canvas shows.
+# Every committed shape, bucket fill, pixel-art text session and terminal-text
+# label becomes ONE object: an id, a kind, a single colour, metadata (``data``)
+# and — for pixel objects — the exact set of canvas pixels it owns. Objects sit
+# on top of the base raster (freehand paint/eraser) and render in z-order = list
+# order, so later objects cover earlier ones. Labels are the exception: they are
+# a terminal overlay (kind "label", no pixels) drawn over the composite. The
+# object itself is what syncs to the server and what see_canvas shows.
+#
+# ``data`` carries the type-specific metadata that makes an object re-appliable
+# and human-readable: a shape's kind/bounds/thickness, a fill's pixel count, a
+# text session's characters + glyph positions, a label's per-line (row, col,
+# text). For labels ``data["lines"]`` is in terminal-cell coordinates (NOT
+# canvas pixels); the hitbox — the bounding rectangle covering every character
+# cell — is computed on demand, and the select tool uses it for hit-testing,
+# move and delete.
 
 
 @dataclass
-class LabelObject:
-    """One terminal-text label: an id, per-line ``(row, col, text)`` starts in
-    typing order, and a single colour. ``lines`` is in terminal-cell
-    coordinates (NOT canvas pixels)."""
-    label_id: int
-    lines: list[tuple[int, int, str]]
+class Object:
+    """One committed drawing, in z-order = ``_objects`` list order."""
+    oid: int
+    kind: str            # "shape" | "fill" | "text" | "label"
     color: Color
+    data: dict[str, Any]
+    pixels: set[tuple[int, int]] = field(default_factory=set)  # empty for labels
 
 
 # The selection border draws in this bright colour so it stands out against
@@ -579,17 +587,17 @@ class LabelObject:
 SELECTION_COLOR: Color = (0, 255, 255)
 
 
-def label_cells(obj: LabelObject) -> dict[tuple[int, int], tuple[str, Color]]:
+def label_cells(obj: Object) -> dict[tuple[int, int], tuple[str, Color]]:
     """Expand a label object into its per-cell overlay:
     ``{(row, col): (char, color)}`` for every character it renders."""
     out: dict[tuple[int, int], tuple[str, Color]] = {}
-    for row, col, text in obj.lines:
+    for row, col, text in obj.data["lines"]:
         for i, char in enumerate(text):
             out[(row, col + i)] = (char, obj.color)
     return out
 
 
-def label_hitbox(obj: LabelObject) -> tuple[int, int, int, int] | None:
+def label_hitbox(obj: Object) -> tuple[int, int, int, int] | None:
     """The bounding rectangle ``(row_min, col_min, row_max, col_max)`` covering
     every character cell the label renders, or None for an empty label."""
     cells = label_cells(obj)
@@ -631,6 +639,16 @@ def label_border_cells(
     cells[(r1 + 1, c0 - 1)] = "└"
     cells[(r1 + 1, c1 + 1)] = "┘"
     return cells
+
+
+def pixel_bounds(pixels: set[tuple[int, int]]) -> tuple[int, int, int, int] | None:
+    """The inclusive bounding box ``(x_min, y_min, x_max, y_max)`` over a set of
+    canvas pixels, or None for an empty set."""
+    if not pixels:
+        return None
+    xs = [x for x, _y in pixels]
+    ys = [y for _x, y in pixels]
+    return min(xs), min(ys), max(xs), max(ys)
 
 
 # --------------------------------------------------------------------------- #
@@ -682,26 +700,33 @@ class CanvasApp:
         self._preview_pixels: dict[tuple[int, int], Color] = {}
 
         # In-progress text entry: the insertion point, the x every new line
-        # starts at, the glyphs typed so far (for backspace) and each changed
-        # pixel's pre-edit colour (for Escape's whole-session undo). Empty until
-        # the text tool is clicked on the canvas.
+        # starts at, the glyphs typed so far (for backspace), the session's
+        # colour (fixed at placement, so a text object always has one colour)
+        # and every pixel the session has drawn so far. The session renders as a
+        # live overlay and becomes ONE object when finalized; Escape drops it.
+        # ``_text_edit_oid`` is the object being re-opened by the select tool's
+        # Enter (it renders via the session instead of in place);
+        # ``_text_edit_original`` is a copy of its pre-edit content so Escape
+        # reverts to it. Empty until the text tool is clicked on the canvas.
         self._text_active = False
         self._text_x = 0
         self._text_y = 0
         self._text_line_start_x = 0
         self._text_history: list[dict[str, Any]] = []
-        self._text_undo: dict[tuple[int, int], Color] = {}
+        self._text_color: Color = self._color
+        self._text_session_pixels: set[tuple[int, int]] = set()
+        self._text_edit_oid: int | None = None
+        self._text_edit_original: Object | None = None
 
-        # Stored terminal-text labels: a list of ``LabelObject`` (id, per-line
-        # start position, text, colour) in terminal-cell coordinates (NOT canvas
-        # pixels), kept in sync with the server. One text-entry session becomes
-        # exactly one object. ``_selected_label_id`` is the select tool's single
-        # selection (only one label selected at a time).
-        self._labels: list[LabelObject] = []
-        self._label_next_id = 1
-        self._selected_label_id: int | None = None
+        # Stored objects: every committed shape, bucket fill, pixel-art text
+        # session and terminal-text label, in z-order = list order (later
+        # objects render on top). Kept in sync with the server. ``_selected_id``
+        # is the select tool's single selection (only one object at a time).
+        self._objects: list[Object] = []
+        self._object_next_id = 1
+        self._selected_id: int | None = None
         # In-progress label entry (terminal cells, not pixels). The session's
-        # typed cells render on top of the stored labels and only become
+        # typed cells render on top of the stored objects and only become
         # permanent (a brand-new object, or an in-place edit of the object being
         # edited) when the session is finalized. ``_label_color`` is fixed at
         # the session start, so a label object always has a single colour.
@@ -717,21 +742,24 @@ class CanvasApp:
         # ``_label_edit_original`` is a copy of its pre-edit content so Escape
         # reverts to it. Both are None for a fresh label session.
         self._label_edit_oid: int | None = None
-        self._label_edit_original: LabelObject | None = None
-        # Select-tool drag state for moving a label: which object is being
-        # dragged, where the press landed relative to its hitbox's top-left,
-        # and the dimmed preview object (uncommitted until release).
-        self._label_drag_id: int | None = None
-        self._label_drag_offset: tuple[int, int] | None = None
-        self._label_drag_preview: LabelObject | None = None
+        self._label_edit_original: Object | None = None
+        # Select-tool drag state for moving an object: which object is being
+        # dragged, where the press landed relative to its hitbox's top-left, and
+        # the dimmed preview (labels use an overlay preview object; pixel
+        # objects use a shifted pixel set rendered via ``_preview_pixels``).
+        self._drag_id: int | None = None
+        self._drag_offset: tuple[int, int] | None = None
+        self._label_drag_preview: Object | None = None
+        self._object_drag_offset: tuple[int, int] | None = None
+        self._object_drag_preview: set[tuple[int, int]] | None = None
         # The current on-screen overlay (stored labels + session + drag preview
         # + selection border), diffed against ``_old_label_chars`` so label
         # edits rewrite only the affected terminal columns.
         self._label_chars: dict[tuple[int, int], tuple[str, Color]] = {}
         self._old_label_chars: dict[tuple[int, int], tuple[str, Color]] = {}
         # The last wire representation we synced (or received), so redundant
-        # ``_sync_labels`` calls don't re-broadcast an unchanged label list.
-        self._last_label_wire: list[dict[str, Any]] | None = None
+        # ``_sync_objects`` calls don't re-broadcast an unchanged object list.
+        self._last_objects_wire: list[dict[str, Any]] | None = None
 
         self._sock: socket.socket | None = None
         self._quit = threading.Event()
@@ -852,7 +880,7 @@ class CanvasApp:
                     row = message["pixels"][y]
                     for x in range(min(self._width, len(row))):
                         self._pixels[y][x] = tuple(row[x])
-                self._apply_labels(message.get("labels", []))
+                self._apply_objects(message.get("objects", []))
             elif msg_type == "update":
                 if not self._pixels:
                     return
@@ -860,8 +888,8 @@ class CanvasApp:
                     x, y = change["x"], change["y"]
                     if 0 <= x < self._width and 0 <= y < self._height:
                         self._pixels[y][x] = tuple(change["color"])
-            elif msg_type == "labels":
-                self._apply_labels(message.get("labels", []))
+            elif msg_type == "objects":
+                self._apply_objects(message.get("objects", []))
             else:
                 return
             self._draw()
@@ -870,27 +898,64 @@ class CanvasApp:
         self._width, self._height = width, height
         self._background = background
         self._pixels = [[background] * width for _ in range(height)]
+        self._clip_objects_to_canvas()
         self._cursor_x = min(self._cursor_x, max(0, width - 1))
         self._cursor_y = min(self._cursor_y, max(0, height - 1))
 
+    def _clip_objects_to_canvas(self) -> None:
+        """Clip every pixel object to the current canvas, dropping empties.
+        Labels are an overlay and are left untouched."""
+        kept: list[Object] = []
+        for obj in self._objects:
+            if obj.kind != "label":
+                obj.pixels = {
+                    (x, y) for (x, y) in obj.pixels
+                    if 0 <= x < self._width and 0 <= y < self._height
+                }
+                if not obj.pixels:
+                    continue
+            kept.append(obj)
+        self._objects = kept
+
     # -- drawing ---------------------------------------------------------------
+
+    def _render_color(self, x: int, y: int) -> Color:
+        """The colour shown at canvas pixel (x, y): the in-progress text
+        session, then stored objects in z-order (later = on top), then the base
+        raster (freehand paint/eraser).
+
+        The object being moved by the select tool and the one being edited by
+        the text tool render via their previews/sessions instead, so they are
+        skipped here and shown at the preview position."""
+        if self._text_active and (x, y) in self._text_session_pixels:
+            return self._text_color
+        for obj in reversed(self._objects):
+            if obj.kind == "label":
+                continue
+            if self._drag_id is not None and obj.oid == self._drag_id:
+                continue
+            if self._text_edit_oid is not None and obj.oid == self._text_edit_oid:
+                continue
+            if (x, y) in obj.pixels:
+                return obj.color
+        return self._pixels[y][x]
 
     def _display_rows(self) -> list[list[Cell]]:
         """Current desired screen content: one cell per (2 vertical pixels).
 
         Only the rows that fit in the visible canvas area are returned; a
         canvas taller than the window shows its top rows. An in-progress shape
-        drag overlays its preview pixels here (local only, never committed).
-        """
+        drag overlays its preview pixels here (local only, never committed);
+        stored objects composite over the base raster via ``_render_color``."""
         layout = self._layout()
         rows: list[list[Cell]] = []
         for y in range(0, min(self._height, layout["canvas_rows"] * 2), 2):
             row: list[Cell] = []
             has_bottom = y + 1 < self._height
             for x in range(self._width):
-                top = self._preview_pixels.get((x, y), self._pixels[y][x])
+                top = self._preview_pixels.get((x, y), self._render_color(x, y))
                 if has_bottom:
-                    bottom = self._preview_pixels.get((x, y + 1), self._pixels[y + 1][x])
+                    bottom = self._preview_pixels.get((x, y + 1), self._render_color(x, y + 1))
                 else:
                     bottom = self._background
                 row.append((top, bottom))
@@ -1199,7 +1264,7 @@ class CanvasApp:
         file = self._console.file
         layout = self._layout()
         rows = self._display_rows()
-        self._label_chars = self._build_label_chars()
+        self._label_chars = self._build_object_chars()
 
         header = self._render_top_line()
         if header != self._old_header:
@@ -1376,7 +1441,7 @@ class CanvasApp:
             file = self._console.file
             layout = self._layout()
             rows = self._display_rows()
-            self._label_chars = self._build_label_chars()
+            self._label_chars = self._build_object_chars()
 
             header = self._render_top_line()
             if header != self._old_header:
@@ -1590,18 +1655,31 @@ class CanvasApp:
         return self._paint(self._cursor_x, self._cursor_y, self._brush_color())
 
     def _flood_fill(self, x: int, y: int) -> list[dict[str, Any]]:
-        """Paint the connected same-colour region at (x, y) with the current
-        color, returned as ONE batch of changes (a single canvas update)."""
+        """Flood-fill the connected same-colour region at (x, y) with the
+        current color, as ONE fill object (a single objects sync, not a pixel
+        edit). The fill sees the composite — base + objects — so overlapping
+        content is a wall for the fill."""
         if not (0 <= x < self._width and 0 <= y < self._height):
             return []
-        if self._pixels[y][x] == self._color:
+        grid = [[self._render_color(px, py) for px in range(self._width)]
+                for py in range(self._height)]
+        if grid[y][x] == self._color:
             return []  # the region is already the fill colour: a no-op
-        changes: list[dict[str, Any]] = []
-        for cx, cy in flood_fill_region(self._pixels, x, y):
-            change = self._paint_pixel(cx, cy, self._color)
-            if change is not None:
-                changes.append(change)
-        return changes
+        region = flood_fill_region(grid, x, y)
+        if not region:
+            return []
+        obj = Object(
+            oid=self._object_next_id,
+            kind="fill",
+            color=self._color,
+            data={"pixel_count": len(region)},
+            pixels=region,
+        )
+        self._object_next_id += 1
+        self._objects.append(obj)
+        self._sync_objects()
+        self._pending_chrome = False  # the object renders via a full _draw()
+        return []
 
     def _erase(self) -> list[dict[str, Any]]:
         return self._paint(self._cursor_x, self._cursor_y, self._background)
@@ -1615,6 +1693,8 @@ class CanvasApp:
         for y in range(min(old_h, new_h)):
             for x in range(min(old_w, new_w)):
                 self._pixels[y][x] = old[y][x]
+        self._clip_objects_to_canvas()
+        self._sync_objects()
         self._cursor_x = min(self._cursor_x, max(0, new_w - 1))
         self._cursor_y = min(self._cursor_y, max(0, new_h - 1))
 
@@ -1671,8 +1751,8 @@ class CanvasApp:
         self._label_finalize()
         self._tool = tool
         if tool != TOOL_SELECT:
-            cleared = self._selected_label_id is not None
-            self._selected_label_id = None
+            cleared = self._selected_id is not None
+            self._selected_id = None
             self._pending_chrome = not cleared
         else:
             self._pending_chrome = True
@@ -1684,8 +1764,8 @@ class CanvasApp:
         self._text_finalize()
         self._label_finalize()
         self._tool = TOOL_ERASER if self._tool != TOOL_ERASER else TOOL_PAINT
-        if self._selected_label_id is not None:
-            self._selected_label_id = None
+        if self._selected_id is not None:
+            self._selected_id = None
             self._pending_chrome = False  # full redraw clears the border
         else:
             self._pending_chrome = True
@@ -1731,16 +1811,6 @@ class CanvasApp:
             return hollow_rect_cells(x1, y1, x2, y2, self._brush_size)
         return thick_line_cells(x1, y1, x2, y2, self._brush_size)
 
-    def _apply_shape_cells(self, cells: set[tuple[int, int]]) -> list[dict[str, Any]]:
-        """Commit shape cells to the local canvas, clipped; returns the changes."""
-        changes: list[dict[str, Any]] = []
-        for x, y in cells:
-            if 0 <= x < self._width and 0 <= y < self._height:
-                change = self._paint_pixel(x, y, self._color)
-                if change is not None:
-                    changes.append(change)
-        return changes
-
     def _shape_motion(self, x: int, y: int) -> list[dict[str, Any]]:
         """Press starts a shape drag; motion moves its end. Nothing is committed."""
         if self._shape_drag is None:
@@ -1759,16 +1829,49 @@ class CanvasApp:
         self._preview_pixels = {cell: dimmed for cell in cells}
 
     def _commit_shape(self) -> list[dict[str, Any]]:
-        """Commit the in-progress shape as a normal edit; clears the preview."""
+        """Commit the in-progress shape as one shape object; clears the preview.
+
+        The shape becomes an Object in z-order on top of the base raster, and
+        is synced as an objects message (not per-pixel edits).
+        """
         if self._shape_drag is None:
             return []
-        changes = self._apply_shape_cells(
-            self._shape_cells(self._shape_drag, self._shape_end)
-        )
+        x1, y1 = self._shape_drag
+        x2, y2 = self._shape_end
+        if self._tool in (TOOL_FILLED_SQUARE, TOOL_HOLLOW_SQUARE):
+            x2, y2 = square_end(self._shape_drag, self._shape_end)
+        cells = self._shape_cells((x1, y1), (x2, y2))
+        clipped = {(x, y) for (x, y) in cells
+                   if 0 <= x < self._width and 0 <= y < self._height}
         self._shape_drag = None
         self._shape_end = None
         self._preview_pixels = {}
-        return changes
+        if not clipped:
+            return []  # the whole shape was off-canvas: drop it
+        shape_type = {
+            TOOL_FILLED_RECT: "filled_rect",
+            TOOL_FILLED_SQUARE: "filled_square",
+            TOOL_HOLLOW_RECT: "hollow_rect",
+            TOOL_HOLLOW_SQUARE: "hollow_square",
+            TOOL_LINE: "line",
+        }[self._tool]
+        obj = Object(
+            oid=self._object_next_id,
+            kind="shape",
+            color=self._color,
+            data={
+                "shape_type": shape_type,
+                "x1": min(x1, x2), "y1": min(y1, y2),
+                "x2": max(x1, x2), "y2": max(y1, y2),
+                "thickness": self._brush_size,
+            },
+            pixels=clipped,
+        )
+        self._object_next_id += 1
+        self._objects.append(obj)
+        self._sync_objects()
+        self._pending_chrome = False  # the object renders via a full _draw()
+        return []
 
     def _cancel_shape_drag(self) -> None:
         """Escape during a drag: drop the preview, leave the canvas untouched."""
@@ -1783,14 +1886,14 @@ class CanvasApp:
     # -- text tool state machine -------------------------------------------
     #
     # Selecting the text tool and clicking the canvas starts a text session at
-    # that pixel. Each character typed is drawn immediately (and sent to the
-    # server like any other edit), backspace erases the last character, Enter
-    # starts a new line below, and Escape reverts EVERYTHING drawn during the
-    # session (tracked in ``_text_undo``). Clicking elsewhere or switching tools
-    # finalizes the text — nothing more can be reverted after that. The brush
-    # slider and ``+``/``-`` keys set the text scale while the text tool is
-    # active; each glyph is drawn at the scale in effect when it is typed, so a
-    # mid-session scale change only affects characters typed after it.
+    # that pixel. Each character typed is drawn immediately (into the session's
+    # pixel set, composited live — the base raster is never touched), backspace
+    # erases the last character, Enter starts a new line below, and Escape drops
+    # the whole session. Clicking elsewhere or switching tools finalizes the
+    # session: it becomes ONE text Object (glyphs, cursor, pixels) synced to the
+    # server. The brush slider and ``+``/``-`` keys set the text scale while the
+    # text tool is active; each glyph is drawn at the scale in effect when it is
+    # typed, so a mid-session scale change only affects characters after it.
 
     def _text_place(self, x: int, y: int) -> list[dict[str, Any]]:
         """Start a text session at (x, y); a previous session is finalized."""
@@ -1800,10 +1903,13 @@ class CanvasApp:
         self._text_y = y
         self._text_line_start_x = x
         self._text_history = []
-        self._text_undo = {}
+        self._text_session_pixels = set()
+        self._text_color = self._color  # fixed at placement: one colour per text
+        self._text_edit_oid = None
+        self._text_edit_original = None
         self._cursor_x = x
         self._cursor_y = y
-        self._pending_chrome = True
+        self._pending_chrome = False  # the session renders via a full _draw()
         return []
 
     def _text_type_char(self, ch: str) -> list[dict[str, Any]]:
@@ -1828,8 +1934,9 @@ class CanvasApp:
         If that box would not fit on the canvas the character is simply not
         accepted (the user can press Enter to drop a line). The scale is read
         at draw time, so changing it mid-session only affects characters typed
-        after the change. The pre-edit colour of every pixel we actually change
-        is remembered in ``_text_undo`` so Escape can revert the whole session.
+        after the change. The glyph's pixels accumulate in
+        ``_text_session_pixels`` and are composited live; nothing is committed
+        to the base raster until the session finalizes.
         """
         scale = self._text_scale
         if (
@@ -1837,32 +1944,29 @@ class CanvasApp:
             or self._text_y + FONT_H * scale > self._height
         ):
             return []  # out of bounds: stop accepting characters
-        changes: list[dict[str, Any]] = []
-        glyph_pixels_drawn: list[tuple[int, int]] = []
+        glyph_drawn: set[tuple[int, int]] = set()
         for px, py in glyph_pixels(ch, self._text_x, self._text_y, scale):
-            old = self._pixels[py][px]
-            if old == self._color:
-                continue  # already this colour: nothing to draw or undo
-            if (px, py) not in self._text_undo:
-                self._text_undo[(px, py)] = old
-            self._pixels[py][px] = self._color
-            changes.append({"x": px, "y": py, "color": list(self._color)})
-            glyph_pixels_drawn.append((px, py))
+            if 0 <= px < self._width and 0 <= py < self._height:
+                glyph_drawn.add((px, py))
+        self._text_session_pixels |= glyph_drawn
         self._text_history.append(
             {"kind": "glyph", "x": self._text_x, "y": self._text_y,
-             "pixels": glyph_pixels_drawn}
+             "char": ch, "scale": scale, "pixels": glyph_drawn}
         )
         self._text_x += (FONT_W + FONT_SPACING) * scale
         self._sync_text_caret()
-        return changes
+        self._pending_chrome = False
+        return []
 
     def _text_draw_space(self) -> list[dict[str, Any]]:
         """A space advances the insertion point without drawing any pixels."""
         self._text_history.append(
-            {"kind": "glyph", "x": self._text_x, "y": self._text_y, "pixels": []}
+            {"kind": "glyph", "x": self._text_x, "y": self._text_y,
+             "char": " ", "scale": self._text_scale, "pixels": set()}
         )
         self._text_x += (FONT_W + FONT_SPACING) * self._text_scale
         self._sync_text_caret()
+        self._pending_chrome = False
         return []
 
     def _text_newline(self) -> list[dict[str, Any]]:
@@ -1881,6 +1985,7 @@ class CanvasApp:
         self._text_x = self._text_line_start_x
         self._text_y = new_y
         self._sync_text_caret()
+        self._pending_chrome = False
         return []
 
     def _text_backspace(self) -> list[dict[str, Any]]:
@@ -1888,38 +1993,92 @@ class CanvasApp:
         if not self._text_history:
             return []
         entry = self._text_history.pop()
-        changes: list[dict[str, Any]] = []
         if entry["kind"] == "newline":
             self._text_x, self._text_y = entry["x"], entry["y"]
         else:
-            for px, py in entry["pixels"]:
-                old = self._text_undo.pop((px, py), None)
-                if old is not None and self._pixels[py][px] != old:
-                    self._pixels[py][px] = old
-                    changes.append({"x": px, "y": py, "color": list(old)})
+            self._text_session_pixels -= entry["pixels"]
             self._text_x, self._text_y = entry["x"], entry["y"]
         self._sync_text_caret()
-        return changes
+        self._pending_chrome = False
+        return []
 
     def _text_cancel(self) -> list[dict[str, Any]]:
-        """Escape: revert every pixel drawn during this text session."""
+        """Escape: drop the whole text session (the base raster was never
+        touched). An in-place edit of an existing text object restores the
+        pre-edit content — Escape reverts, it never deletes."""
         if not self._text_active:
             return []
-        changes: list[dict[str, Any]] = []
-        for (px, py), old in self._text_undo.items():
-            if self._pixels[py][px] != old:
-                self._pixels[py][px] = old
-                changes.append({"x": px, "y": py, "color": list(old)})
+        if (self._text_edit_oid is not None
+                and self._text_edit_original is not None):
+            self._replace_object(self._text_edit_original)
         self._text_active = False
         self._text_history = []
-        self._text_undo = {}
-        return changes
+        self._text_session_pixels = set()
+        self._text_edit_oid = None
+        self._text_edit_original = None
+        self._sync_objects()
+        self._pending_chrome = False  # force _after_edit to redraw the canvas
+        return []
+
+    def _text_data(self) -> dict[str, Any]:
+        """The text object's metadata: the text string, per-glyph placement and
+        the cursor position. Derived from the session history (which backspace
+        has pruned), so it always matches the session pixels."""
+        rows: list[list[tuple[int, int, str, int]]] = []
+        current: list[tuple[int, int, str, int]] = []
+        for entry in self._text_history:
+            if entry["kind"] == "newline":
+                rows.append(current)
+                current = []
+            else:
+                current.append(
+                    (entry["x"], entry["y"], entry["char"], entry["scale"])
+                )
+        rows.append(current)
+        return {
+            "text": "\n".join("".join(ch for _x, _y, ch, _s in row)
+                              for row in rows),
+            "glyphs": [
+                {"char": ch, "x": x, "y": y, "scale": s}
+                for row in rows for (x, y, ch, s) in row
+            ],
+            "cursor": [self._text_x, self._text_y],
+        }
 
     def _text_finalize(self) -> None:
-        """Commit any in-progress text: nothing more can be reverted."""
+        """Commit any in-progress text session: build a text Object (or replace
+        the one being edited) and sync. Visual-no-change, so no redraw."""
+        if self._text_active:
+            if self._text_edit_oid is not None:
+                if self._text_session_pixels:
+                    self._replace_object(Object(
+                        oid=self._text_edit_oid,
+                        kind="text",
+                        color=self._text_color,
+                        data=self._text_data(),
+                        pixels=self._text_session_pixels,
+                    ))
+                else:
+                    # The edit removed every character: delete the object.
+                    self._objects = [o for o in self._objects
+                                     if o.oid != self._text_edit_oid]
+                    if self._selected_id == self._text_edit_oid:
+                        self._selected_id = None
+            elif self._text_session_pixels:
+                self._objects.append(Object(
+                    oid=self._object_next_id,
+                    kind="text",
+                    color=self._text_color,
+                    data=self._text_data(),
+                    pixels=self._text_session_pixels,
+                ))
+                self._object_next_id += 1
+            self._sync_objects()
         self._text_active = False
         self._text_history = []
-        self._text_undo = {}
+        self._text_session_pixels = set()
+        self._text_edit_oid = None
+        self._text_edit_original = None
 
     def _sync_text_caret(self) -> None:
         """Move the canvas cursor to the text insertion point (clamped)."""
@@ -1935,19 +2094,21 @@ class CanvasApp:
     # the pixel grid in the terminal's own font; backspace removes the last
     # character, Enter starts a new line below, and Escape cancels the whole
     # in-progress label. Clicking elsewhere or switching tools finalizes it —
-    # the session becomes ONE ``LabelObject`` (id, per-line positions, text,
-    # colour, hitbox) and is synced to the server, which see_canvas shows.
-    # Labels never touch the pixel grid: they are an overlay.
+    # the session becomes ONE ``Object`` of kind ``"label"`` (id, per-line
+    # positions, text, colour, hitbox) and is synced to the server, which
+    # see_canvas shows. Labels never touch the pixel grid: they are an overlay.
     #
-    # The select tool turns those objects into manipulable things: clicking
-    # inside a label's hitbox selects it (a cyan box-drawing border wraps the
-    # hitbox), clicking empty space deselects, dragging moves it (a dimmed
-    # preview follows the cursor; release commits the new position), Delete or
-    # Backspace removes the object entirely, and Enter re-opens it for in-place
-    # editing — cursor at the end of its text, backspace/typing modify it in
-    # place, and Escape reverts to the pre-edit content (it does not delete, as
-    # it does for a fresh label session, which has nothing to revert to). Only
-    # one label is ever selected, and selection never touches the pixel canvas.
+    # The select tool turns every object (labels, shapes, fills, pixel-text)
+    # into manipulable things: clicking inside an object's hitbox selects it (a
+    # cyan box-drawing border wraps the hitbox), clicking empty space
+    # deselects, dragging moves it (a dimmed preview follows the cursor; release
+    # commits the new position), Delete or Backspace removes the object
+    # entirely, and Enter re-opens text-based objects (labels and pixel-text)
+    # for in-place editing — cursor at the end of its text, backspace/typing
+    # modify it in place, and Escape reverts to the pre-edit content (it does
+    # not delete, as it does for a fresh session, which has nothing to revert
+    # to). Only one object is ever selected, and selection never touches the
+    # base pixel canvas.
 
     def _label_place(self, row: int, col: int) -> list[dict[str, Any]]:
         """Start a fresh label session at terminal cell (row, col); finalize any
@@ -1956,7 +2117,7 @@ class CanvasApp:
         so ``_after_edit`` must do a full ``_draw()``, not just a chrome redraw."""
         self._text_finalize()
         self._label_finalize()
-        self._selected_label_id = None
+        self._selected_id = None
         self._label_active = True
         self._label_row = row
         self._label_col = col
@@ -2060,69 +2221,70 @@ class CanvasApp:
             return []
         if (self._label_edit_oid is not None
                 and self._label_edit_original is not None):
-            self._replace_label(self._label_edit_original)
+            self._replace_object(self._label_edit_original)
         self._label_active = False
         self._label_session_cells = {}
         self._label_history = []
         self._label_edit_oid = None
         self._label_edit_original = None
-        self._sync_labels()
+        self._sync_objects()
         self._pending_chrome = False  # force _after_edit to redraw the canvas
         return []
 
     def _label_finalize(self) -> None:
         """Commit any in-progress label session.
 
-        A fresh session becomes a brand-new ``LabelObject``; an in-place edit
+        A fresh session becomes a brand-new ``Object``; an in-place edit
         replaces the object with the same id (an edit that deleted every
         character removes the label). Visual-no-change, so no redraw.
         """
         if self._label_active:
             if self._label_edit_oid is not None:
                 if self._label_session_cells:
-                    self._replace_label(self._object_from_cells(
+                    self._replace_object(self._object_from_cells(
                         self._label_edit_oid, self._label_session_cells,
                         self._label_color,
                     ))
                 else:
                     # The edit removed every character: delete the object.
-                    self._labels = [o for o in self._labels
-                                    if o.label_id != self._label_edit_oid]
-                    self._selected_label_id = None
+                    self._objects = [o for o in self._objects
+                                     if o.oid != self._label_edit_oid]
+                    if self._selected_id == self._label_edit_oid:
+                        self._selected_id = None
             elif self._label_session_cells:
                 obj = self._object_from_cells(
-                    self._label_next_id, self._label_session_cells,
+                    self._object_next_id, self._label_session_cells,
                     self._label_color,
                 )
-                self._labels.append(obj)
-                self._label_next_id += 1
+                self._objects.append(obj)
+                self._object_next_id += 1
         self._label_active = False
         self._label_session_cells = {}
         self._label_history = []
         self._label_edit_oid = None
         self._label_edit_original = None
-        self._sync_labels()
+        self._sync_objects()
 
     def _object_from_cells(
         self, oid: int, cells: dict[tuple[int, int], tuple[str, Color]],
         color: Color,
-    ) -> LabelObject:
-        """Group session cells back into a LabelObject. Each row of cells
+    ) -> Object:
+        """Group session cells back into a label Object. Each row of cells
         becomes one line (cells are always contiguous per row while typing)."""
         lines: list[tuple[int, int, str]] = []
         for row in sorted({r for r, _c in cells}):
             cols = sorted(c for r, c in cells if r == row)
             text = "".join(cells[(row, c)][0] for c in cols)
             lines.append((row, cols[0], text))
-        return LabelObject(oid, lines, color)
+        return Object(oid, "label", color, {"lines": lines})
 
-    def _replace_label(self, obj: LabelObject) -> None:
-        """Swap the stored object with ``obj.label_id`` for ``obj``."""
-        for i, existing in enumerate(self._labels):
-            if existing.label_id == obj.label_id:
-                self._labels[i] = obj
+    def _replace_object(self, obj: Object) -> None:
+        """Swap the stored object with ``obj.oid`` for ``obj``."""
+        for i, existing in enumerate(self._objects):
+            if existing.oid == obj.oid:
+                self._objects[i] = obj
                 return
-        self._labels.append(obj)  # unknown id (shouldn't happen): just add it
+        self._objects.append(obj)  # unknown id (shouldn't happen): just add it
 
     def _sync_label_caret(self) -> None:
         """Move the canvas cursor to the label insertion point (clamped to the
@@ -2135,18 +2297,36 @@ class CanvasApp:
     def _tool_select(self) -> list[dict[str, Any]]:
         return self._set_tool(TOOL_SELECT)
 
-    def _selected_label(self) -> LabelObject | None:
-        """The currently selected label object, or None."""
-        for obj in self._labels:
-            if obj.label_id == self._selected_label_id:
+    def _selected_object(self) -> Object | None:
+        """The currently selected object, or None."""
+        for obj in self._objects:
+            if obj.oid == self._selected_id:
                 return obj
         return None
 
-    def _label_at(self, row: int, col: int) -> LabelObject | None:
-        """The topmost label whose hitbox contains terminal cell (row, col), or
-        None. Later labels are drawn on top, so they win on overlap."""
-        for obj in reversed(self._labels):
-            hitbox = label_hitbox(obj)
+    def _pixel_hitbox(
+        self, pixels: set[tuple[int, int]]
+    ) -> tuple[int, int, int, int] | None:
+        """The terminal-cell rect a pixel object's bounds occupy: each pixel is
+        CELL_W terminal columns wide and half a display row tall."""
+        bounds = pixel_bounds(pixels)
+        if bounds is None:
+            return None
+        x0, y0, x1, y1 = bounds
+        return (y0 // 2, x0 * CELL_W, y1 // 2, x1 * CELL_W + CELL_W - 1)
+
+    def _object_hitbox(self, obj: Object) -> tuple[int, int, int, int] | None:
+        """The terminal-cell hitbox of an object: labels use their text cells,
+        pixel objects (shape/fill/text) their pixel bounds."""
+        if obj.kind == "label":
+            return label_hitbox(obj)
+        return self._pixel_hitbox(obj.pixels)
+
+    def _object_at(self, row: int, col: int) -> Object | None:
+        """The topmost object whose hitbox contains terminal cell (row, col),
+        or None. Later objects are drawn on top, so they win on overlap."""
+        for obj in reversed(self._objects):
+            hitbox = self._object_hitbox(obj)
             if hitbox is None:
                 continue
             r0, c0, r1, c1 = hitbox
@@ -2156,89 +2336,204 @@ class CanvasApp:
 
     def _selection_hitbox(self) -> tuple[int, int, int, int] | None:
         """The hitbox the selection border should wrap right now: the dragged
-        label's preview while dragging, the edited label's current content while
-        editing, otherwise the stored object's hitbox."""
+        object's preview while dragging, the edited object's current content
+        while editing, otherwise the selected object's hitbox."""
         if self._label_drag_preview is not None:
             return label_hitbox(self._label_drag_preview)
+        if self._object_drag_preview is not None:
+            return self._pixel_hitbox(self._object_drag_preview)
         if self._label_edit_oid is not None:
             return hitbox_from_cells(self._label_session_cells)
-        obj = self._selected_label()
+        if self._text_edit_oid is not None:
+            return self._pixel_hitbox(self._text_session_pixels)
+        obj = self._selected_object()
         if obj is None:
             return None
-        return label_hitbox(obj)
+        return self._object_hitbox(obj)
 
-    def _deselect_label(self) -> None:
+    def _deselect_object(self) -> None:
         """Clear the select tool's selection (and any in-progress drag)."""
-        self._selected_label_id = None
-        self._label_drag_id = None
-        self._label_drag_offset = None
+        self._selected_id = None
+        self._drag_id = None
+        self._drag_offset = None
+        self._object_drag_offset = None
         self._label_drag_preview = None
+        self._object_drag_preview = None
+        self._preview_pixels = {}
 
-    def _handle_label_select_press(
+    def _handle_select_press(
         self, button: int, trow: int, tcol: int,
     ) -> list[dict[str, Any]]:
         """A press inside the canvas display area with the select tool active:
-        click a label to select it (switching from any previous selection) and
+        click an object to select it (switching from any previous selection) and
         arm a drag from that press; click empty space to deselect. A simple
         click with no motion just selects."""
         if button != 0:
             return []
         self._text_finalize()
         self._label_finalize()
-        label = self._label_at(trow, tcol)
-        if label is None:
-            self._deselect_label()
+        obj = self._object_at(trow, tcol)
+        if obj is None:
+            self._deselect_object()
             self._pending_chrome = False
             return []  # empty canvas area: deselect
-        self._selected_label_id = label.label_id
-        hitbox = label_hitbox(label)
-        self._label_drag_id = label.label_id
-        self._label_drag_offset = (trow - hitbox[0], tcol - hitbox[1])
+        self._selected_id = obj.oid
+        hitbox = self._object_hitbox(obj)
+        self._drag_id = obj.oid
+        if obj.kind == "label":
+            self._drag_offset = (trow - hitbox[0], tcol - hitbox[1])
+        else:
+            x0, y0, _x1, _y1 = pixel_bounds(obj.pixels)
+            self._object_drag_offset = (tcol // CELL_W - x0, trow * 2 - y0)
         self._pending_chrome = False
         return []
 
-    def _update_label_drag(self, row: int, col: int) -> list[dict[str, Any]]:
-        """Motion during a label drag: move the dimmed preview to follow the
-        cursor, clamped so the whole label stays on the canvas."""
-        obj = self._selected_label()
-        if obj is None or self._label_drag_offset is None:
+    def _update_object_drag(self, row: int, col: int) -> list[dict[str, Any]]:
+        """Motion during an object drag: move the dimmed preview to follow the
+        cursor, clamped so the whole object stays on the canvas."""
+        obj = self._selected_object()
+        if obj is None:
             return []
-        hitbox = label_hitbox(obj)
+        hitbox = self._object_hitbox(obj)
         if hitbox is None:
             return []
-        dr = (row - self._label_drag_offset[0]) - hitbox[0]
-        dc = (col - self._label_drag_offset[1]) - hitbox[1]
-        layout = self._compute_layout()
-        dr = min(max(dr, -hitbox[0]), (layout["canvas_rows"] - 1) - hitbox[2])
-        dc = min(max(dc, -hitbox[1]), (self._width * CELL_W - 1) - hitbox[3])
-        lines = [(r + dr, c + dc, text) for (r, c, text) in obj.lines]
-        self._label_drag_preview = LabelObject(obj.label_id, lines, obj.color)
+        if obj.kind == "label":
+            if self._drag_offset is None:
+                return []
+            dr = (row - self._drag_offset[0]) - hitbox[0]
+            dc = (col - self._drag_offset[1]) - hitbox[1]
+            layout = self._compute_layout()
+            dr = min(max(dr, -hitbox[0]), (layout["canvas_rows"] - 1) - hitbox[2])
+            dc = min(max(dc, -hitbox[1]), (self._width * CELL_W - 1) - hitbox[3])
+            lines = [(r + dr, c + dc, text)
+                     for (r, c, text) in obj.data["lines"]]
+            self._label_drag_preview = Object(
+                obj.oid, "label", obj.color, {"lines": lines},
+            )
+            self._object_drag_preview = None
+        else:
+            if self._object_drag_offset is None:
+                return []
+            x0, y0, x1, y1 = pixel_bounds(obj.pixels)
+            px, py = col // CELL_W, row * 2
+            dx = (px - self._object_drag_offset[0]) - x0
+            dy = (py - self._object_drag_offset[1]) - y0
+            dx = min(max(dx, -x0), (self._width - 1) - x1)
+            dy = min(max(dy, -y0), (self._height - 1) - y1)
+            self._object_drag_preview = {
+                (x + dx, y + dy) for (x, y) in obj.pixels
+            }
+            dimmed = tuple(int(c * PREVIEW_DIM) for c in obj.color)
+            self._preview_pixels = {
+                cell: dimmed for cell in self._object_drag_preview
+            }
+            self._label_drag_preview = None
         self._pending_chrome = False
         return []
 
-    def _commit_label_drag(self) -> list[dict[str, Any]]:
-        """Release: commit any in-progress label drag at the preview position."""
-        if self._label_drag_id is None:
+    def _commit_object_drag(self) -> list[dict[str, Any]]:
+        """Release: commit any in-progress object drag at the preview position."""
+        if self._drag_id is None:
             return []
-        self._label_drag_id = None
-        self._label_drag_offset = None
-        preview = self._label_drag_preview
+        self._drag_id = None
+        self._drag_offset = None
+        self._object_drag_offset = None
+        self._preview_pixels = {}
+        label_preview = self._label_drag_preview
         self._label_drag_preview = None
-        if preview is not None:
-            self._replace_label(preview)
-            self._sync_labels()
+        if label_preview is not None:
+            self._replace_object(label_preview)
+            self._sync_objects()
+        pixel_preview = self._object_drag_preview
+        self._object_drag_preview = None
+        if pixel_preview is not None:
+            obj = self._selected_object()
+            if obj is not None:
+                obj.pixels = pixel_preview
+                self._sync_objects()
         self._pending_chrome = False
         return []
 
-    def _delete_selected_label(self) -> list[dict[str, Any]]:
+    def _delete_selected_object(self) -> list[dict[str, Any]]:
         """Delete/Backspace with the select tool active: remove the selected
-        label object entirely (and sync the removal)."""
-        if self._selected_label_id is None:
+        object entirely (and sync the removal)."""
+        if self._selected_id is None:
             return []
-        self._labels = [o for o in self._labels
-                        if o.label_id != self._selected_label_id]
-        self._selected_label_id = None
-        self._sync_labels()
+        self._objects = [o for o in self._objects
+                         if o.oid != self._selected_id]
+        self._selected_id = None
+        self._sync_objects()
+        self._pending_chrome = False
+        return []
+
+    def _edit_selected_object(self) -> list[dict[str, Any]]:
+        """Enter with the select tool active: re-open the selected object for
+        in-place editing. Only text-based objects (pixel-text and labels) are
+        editable; shapes and fills are a no-op."""
+        obj = self._selected_object()
+        if obj is None:
+            return []
+        if obj.kind == "text":
+            return self._edit_selected_text()
+        if obj.kind == "label":
+            return self._edit_selected_label()
+        return []  # shapes and fills have nothing to edit
+
+    def _edit_selected_text(self) -> list[dict[str, Any]]:
+        """Re-open a pixel-text object for in-place editing: the session starts
+        from the object's stored glyphs and cursor so backspace/typing modify
+        it in place and Escape restores the original."""
+        obj = self._selected_object()
+        if obj is None:
+            return []
+        self._text_finalize()
+        self._label_finalize()
+        self._text_active = True
+        self._text_edit_oid = obj.oid
+        self._text_edit_original = Object(
+            obj.oid, obj.kind, obj.color, dict(obj.data), set(obj.pixels),
+        )
+        self._text_color = obj.color
+        self._text_history = []
+        self._text_session_pixels = set(obj.pixels)
+        glyphs = sorted(
+            obj.data.get("glyphs", []),
+            key=lambda g: (g["y"], g["x"]),
+        )
+        prev_y = None
+        for glyph in glyphs:
+            if prev_y is not None and glyph["y"] != prev_y:
+                # A line break separated these glyphs: re-insert a newline entry
+                # at the current insertion point so the text metadata
+                # reconstructs multi-line text correctly.
+                self._text_history.append({
+                    "kind": "newline", "x": self._text_x, "y": self._text_y,
+                })
+            pixels = set()
+            if glyph["char"] != " ":
+                for px, py in glyph_pixels(
+                    glyph["char"], glyph["x"], glyph["y"], glyph["scale"],
+                ):
+                    if 0 <= px < self._width and 0 <= py < self._height:
+                        pixels.add((px, py))
+            self._text_history.append({
+                "kind": "glyph",
+                "x": glyph["x"], "y": glyph["y"],
+                "char": glyph["char"], "scale": glyph["scale"],
+                "pixels": pixels,
+            })
+            prev_y = glyph["y"]
+        cursor = obj.data.get("cursor")
+        if isinstance(cursor, list) and len(cursor) == 2:
+            self._text_x, self._text_y = int(cursor[0]), int(cursor[1])
+        else:
+            # Fall back to just after the last glyph.
+            self._text_x, self._text_y = 0, 0
+            for glyph in glyphs:
+                self._text_x = glyph["x"] + (FONT_W + FONT_SPACING) * glyph["scale"]
+                self._text_y = glyph["y"]
+        self._text_line_start_x = self._text_x
+        self._sync_text_caret()
         self._pending_chrome = False
         return []
 
@@ -2247,14 +2542,14 @@ class CanvasApp:
         in-place editing, cursor at the end of its last line. Backspace/typing
         modify it in place; Escape reverts to the pre-edit content; finalizing
         (click elsewhere or switch tools) commits the edit."""
-        obj = self._selected_label()
+        obj = self._selected_object()
         if obj is None:
             return []
         self._text_finalize()
         self._label_finalize()
-        self._label_edit_oid = obj.label_id
-        self._label_edit_original = LabelObject(
-            obj.label_id, list(obj.lines), obj.color,
+        self._label_edit_oid = obj.oid
+        self._label_edit_original = Object(
+            obj.oid, "label", obj.color, {"lines": list(obj.data["lines"])},
         )
         self._label_active = True
         self._label_color = obj.color
@@ -2262,7 +2557,7 @@ class CanvasApp:
             (row, col): (char, obj.color)
             for (row, col), (char, _color) in label_cells(obj).items()
         }
-        last_row, last_col, last_text = obj.lines[-1]
+        last_row, last_col, last_text = obj.data["lines"][-1]
         self._label_row = last_row
         self._label_col = last_col + len(last_text)
         self._label_line_start_col = last_col
@@ -2271,21 +2566,23 @@ class CanvasApp:
         self._pending_chrome = False
         return []
 
-    def _build_label_chars(self) -> dict[tuple[int, int], tuple[str, Color]]:
-        """The current overlay: stored labels, any in-progress session, the
-        dimmed drag preview, and the selected label's border ring.
+    def _build_object_chars(self) -> dict[tuple[int, int], tuple[str, Color]]:
+        """The current label overlay: stored label objects, any in-progress
+        session, the dimmed drag preview, and the selection border ring.
 
         The stored loop skips the label being edited (it renders via the
         session cells) and the one being dragged (it renders via the dimmed
         preview), so their previous cells never linger as stale overlay pixels.
         """
         out: dict[tuple[int, int], tuple[str, Color]] = {}
-        for obj in self._labels:
+        for obj in self._objects:
+            if obj.kind != "label":
+                continue
             if (self._label_drag_preview is not None
-                    and obj.label_id == self._label_drag_preview.label_id):
+                    and obj.oid == self._label_drag_preview.oid):
                 continue
             if (self._label_edit_oid is not None
-                    and obj.label_id == self._label_edit_oid):
+                    and obj.oid == self._label_edit_oid):
                 continue
             for (row, col), (char, _color) in label_cells(obj).items():
                 out[(row, col)] = (char, obj.color)
@@ -2304,79 +2601,105 @@ class CanvasApp:
                 out[(row, col)] = (char, SELECTION_COLOR)
         return out
 
-    def _label_wire(self) -> list[dict[str, Any]]:
-        """The label objects as the wire/see_canvas representation."""
+    def _object_wire(self) -> list[dict[str, Any]]:
+        """The stored objects as the wire/see_canvas representation."""
         return [
-            {"id": obj.label_id,
-             "lines": [list(line) for line in obj.lines],
-             "color": list(obj.color)}
-            for obj in self._labels
+            {
+                "id": obj.oid,
+                "kind": obj.kind,
+                "color": list(obj.color),
+                "data": obj.data,
+                "pixels": [list(p) for p in sorted(obj.pixels)],
+            }
+            for obj in self._objects
         ]
 
-    def _sync_labels(self) -> None:
+    def _sync_objects(self) -> None:
         """Push the stored objects to the server whenever they changed."""
-        wire = self._label_wire()
-        if wire != self._last_label_wire:
-            self._last_label_wire = wire
-            self._send_labels()
+        wire = self._object_wire()
+        if wire != self._last_objects_wire:
+            self._last_objects_wire = wire
+            self._send_objects()
 
-    def _send_labels(self) -> None:
-        """Broadcast the full label-object list to the server."""
+    def _send_objects(self) -> None:
+        """Broadcast the full object list to the server."""
         if self._sock is None:
             return
         payload = json.dumps({
-            "type": "labels",
-            "labels": self._last_label_wire or self._label_wire(),
+            "type": "objects",
+            "objects": self._last_objects_wire or self._object_wire(),
         }) + "\n"
         try:
             self._sock.sendall(payload.encode())
         except OSError:
             pass
 
-    def _apply_labels(self, labels: list[Any]) -> None:
-        """Replace stored labels from a server ``labels`` message. Any
-        in-progress label session is cancelled (its cells were not synced)."""
+    def _apply_objects(self, objects: list[Any]) -> None:
+        """Replace stored objects from a server ``objects`` message. Any
+        in-progress text/label session and drag is cancelled (it was not
+        synced)."""
+        self._text_active = False
+        self._text_history = []
+        self._text_session_pixels = set()
+        self._text_edit_oid = None
+        self._text_edit_original = None
         self._label_active = False
         self._label_session_cells = {}
         self._label_history = []
         self._label_edit_oid = None
         self._label_edit_original = None
-        self._label_drag_id = None
-        self._label_drag_offset = None
+        self._drag_id = None
+        self._drag_offset = None
         self._label_drag_preview = None
-        objects: list[LabelObject] = []
-        for entry in labels:
-            if not (isinstance(entry, dict)
-                    and "id" in entry and "lines" in entry and "color" in entry):
-                continue
-            oid = entry["id"]
-            if not isinstance(oid, int):
-                continue
-            try:
-                rgb = tuple(int(c) for c in entry["color"])
-            except (TypeError, ValueError):
-                continue
-            if len(rgb) != 3:
-                continue
-            lines: list[tuple[int, int, str]] = []
-            for line in entry["lines"]:
-                if not (isinstance(line, list) and len(line) == 3):
-                    continue
-                row, col, text = line
-                if not (isinstance(row, int) and isinstance(col, int)
-                        and isinstance(text, str)):
-                    continue
-                lines.append((row, col, text))
-            objects.append(LabelObject(oid, lines, Color(rgb)))
-        self._labels = objects
-        if objects:
-            self._label_next_id = max(self._label_next_id,
-                                      max(o.label_id for o in objects) + 1)
-        if (self._selected_label_id is not None and not any(
-            o.label_id == self._selected_label_id for o in objects
+        self._object_drag_offset = None
+        self._object_drag_preview = None
+        parsed: list[Object] = []
+        for entry in objects:
+            obj = self._parse_object(entry)
+            if obj is not None:
+                parsed.append(obj)
+        self._objects = parsed
+        if parsed:
+            self._object_next_id = max(self._object_next_id,
+                                       max(o.oid for o in parsed) + 1)
+        if (self._selected_id is not None and not any(
+            o.oid == self._selected_id for o in parsed
         )):
-            self._selected_label_id = None
-        self._last_label_wire = self._label_wire()
+            self._selected_id = None
+        self._last_objects_wire = self._object_wire()
+
+    def _parse_object(self, entry: Any) -> Object | None:
+        """Validate one wire object dict into an Object, or None if malformed."""
+        if not (isinstance(entry, dict)
+                and "id" in entry and "kind" in entry
+                and "color" in entry and "data" in entry):
+            return None
+        oid = entry["id"]
+        kind = entry["kind"]
+        if not isinstance(oid, int) or kind not in (
+            "shape", "fill", "text", "label",
+        ):
+            return None
+        try:
+            rgb = tuple(int(c) for c in entry["color"])
+        except (TypeError, ValueError):
+            return None
+        if len(rgb) != 3:
+            return None
+        data = entry["data"]
+        if not isinstance(data, dict):
+            return None
+        pixels: set[tuple[int, int]] = set()
+        if kind != "label":
+            for cell in entry.get("pixels", []):
+                if not (isinstance(cell, (list, tuple)) and len(cell) == 2):
+                    continue
+                try:
+                    x, y = int(cell[0]), int(cell[1])
+                except (TypeError, ValueError):
+                    continue
+                pixels.add((x, y))
+        return Object(oid, kind, Color(rgb), data, pixels)
 
     def _tool_brush_dec(self) -> list[dict[str, Any]]:
         return self._set_size(self._current_size() - 1)
@@ -2453,7 +2776,7 @@ class CanvasApp:
         """
         if not pressed:
             if self._tool == TOOL_SELECT:
-                return self._commit_label_drag()  # release: commit the move
+                return self._commit_object_drag()  # release: commit the move
             return self._commit_shape()  # release: commit any in-progress shape
         if self._custom_color_mode:
             self._exit_custom_color()
@@ -2466,11 +2789,11 @@ class CanvasApp:
         if self._tool == TOOL_SELECT:
             label_hit = self._label_cell(col, row)
             if button in (32, 36):  # mouse motion during a drag
-                if self._label_drag_id is not None and label_hit is not None:
-                    return self._update_label_drag(*label_hit)
+                if self._drag_id is not None and label_hit is not None:
+                    return self._update_object_drag(*label_hit)
                 return []
             if label_hit is not None:
-                return self._handle_label_select_press(button, *label_hit)
+                return self._handle_select_press(button, *label_hit)
         # A canvas click with the text tool places the insertion point. That is
         # the one press that does not finalize text here (any old session is
         # finalized-and-restarted inside _text_place).
@@ -2612,13 +2935,14 @@ class CanvasApp:
             # character — the label renders real terminal text, not brush art.
             return self._label_type_char(ch)
         if self._tool == TOOL_SELECT:
-            # Delete/Backspace removes the selected label object; Enter re-opens
-            # it for in-place editing. Every other key falls through to normal
-            # handling, so tool switches, painting and quit keep working.
-            if ch in ("\x7f", "\x08") and self._selected_label_id is not None:
-                return self._delete_selected_label()
-            if ch in ("\r", "\n") and self._selected_label_id is not None:
-                return self._edit_selected_label()
+            # Delete/Backspace removes the selected object; Enter re-opens it
+            # for in-place editing (text-based objects only). Every other key
+            # falls through to normal handling, so tool switches, painting and
+            # quit keep working.
+            if ch in ("\x7f", "\x08") and self._selected_id is not None:
+                return self._delete_selected_object()
+            if ch in ("\r", "\n") and self._selected_id is not None:
+                return self._edit_selected_object()
         if ch == "q":
             self._quit.set()
             return []

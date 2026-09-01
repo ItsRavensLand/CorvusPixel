@@ -237,10 +237,10 @@ def test_server_resizes_canvas_from_window_message() -> None:
             fake.close()
 
 
-def test_labels_sync_over_socket_and_see_canvas() -> None:
-    """Labels flow window -> server -> other windows, and show in see_canvas."""
+def test_objects_sync_over_socket_and_see_canvas() -> None:
+    """Objects flow window -> server -> other windows, and show in see_canvas."""
     with tempfile.TemporaryDirectory() as td:
-        sock_path = str(Path(td) / "labels.sock")
+        sock_path = str(Path(td) / "objects.sock")
         cs = CanvasServer(sock_path, width=8, height=8, background=(0, 0, 0))
         cs.start()
         fake = FakeRenderer(sock_path)
@@ -248,47 +248,112 @@ def test_labels_sync_over_socket_and_see_canvas() -> None:
             fake.connect()
             initial = fake.read_message()
             assert initial["type"] == "full"
-            assert initial["labels"] == []
+            assert initial["objects"] == []
 
-            # A window broadcasts its label objects; the server stores them and
-            # pushes a labels message to every connected window.
+            # A window broadcasts its object list; the server stores it and
+            # pushes an objects message to every connected window.
             app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             app.connect(sock_path)
             app.sendall(
                 (json.dumps(
-                    {"type": "labels",
-                     "labels": [{"id": 1, "lines": [[0, 1, "HI"]],
-                                 "color": [255, 0, 0]}]}
+                    {"type": "objects",
+                     "objects": [
+                         {"id": 1, "kind": "shape", "color": [255, 0, 0],
+                          "data": {"shape_type": "filled_rect", "x1": 0, "y1": 0,
+                                   "x2": 3, "y2": 3, "thickness": 1},
+                          "pixels": [[0, 0], [1, 1], [2, 2]]},
+                         {"id": 2, "kind": "label", "color": [0, 255, 0],
+                          "data": {"lines": [[0, 1, "HI"]], "cursor": [0, 0]},
+                          "pixels": []},
+                     ]}
                 ) + "\n").encode()
             )
             msg = fake.read_message()
-            assert msg["type"] == "labels"
-            assert msg["labels"] == [
-                {"id": 1, "lines": [[0, 1, "HI"]], "color": [255, 0, 0]}
+            assert msg["type"] == "objects"
+            assert msg["objects"] == [
+                {"id": 1, "kind": "shape", "color": [255, 0, 0],
+                 "data": {"shape_type": "filled_rect", "x1": 0, "y1": 0,
+                          "x2": 3, "y2": 3, "thickness": 1},
+                 "pixels": [[0, 0], [1, 1], [2, 2]]},
+                {"id": 2, "kind": "label", "color": [0, 255, 0],
+                 "data": {"lines": [[0, 1, "HI"]], "cursor": [0, 0]},
+                 "pixels": []},
             ]
 
-            # see_canvas lists the annotations with position and color.
+            # see_canvas lists every object by id with type-aware info.
             out = cs.see_canvas()
-            assert 'labels (terminal rows/cols):' in out
-            assert 'row 0, col 1: "HI" in #ff0000' in out
+            assert "objects:" in out
+            assert "shape 1: filled_rect (0,0)-(3,3) in #ff0000" in out
+            assert 'label 2: row 0, col 1: "HI" in #00ff00' in out
 
-            # A connecting window gets the labels in its fresh full snapshot.
+            # get_canvas composites the object pixels over the base raster.
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][0][0] == [255, 0, 0]  # shape red
+            assert data["pixels"][1][1] == [255, 0, 0]  # shape red
+            assert data["pixels"][2][2] == [255, 0, 0]  # shape red
+            assert data["pixels"][0][1] == [0, 0, 0]  # label has no pixels
+
+            # A connecting window gets the objects in its fresh full snapshot.
             fake.close()
             fake2 = FakeRenderer(sock_path)
             fake2.connect()
             full = fake2.read_message()
-            assert full["labels"] == [
-                {"id": 1, "lines": [[0, 1, "HI"]], "color": [255, 0, 0]}
+            assert full["objects"] == [
+                {"id": 1, "kind": "shape", "color": [255, 0, 0],
+                 "data": {"shape_type": "filled_rect", "x1": 0, "y1": 0,
+                          "x2": 3, "y2": 3, "thickness": 1},
+                 "pixels": [[0, 0], [1, 1], [2, 2]]},
+                {"id": 2, "kind": "label", "color": [0, 255, 0],
+                 "data": {"lines": [[0, 1, "HI"]], "cursor": [0, 0]},
+                 "pixels": []},
             ]
 
-            # init_canvas resets the labels along with the pixels.
+            # init_canvas resets the objects along with the pixels.
             cs.reset(4, 4, (5, 5, 5))
-            assert "labels (terminal rows/cols):" not in cs.see_canvas()
+            assert "objects:" not in cs.see_canvas()
             app.close()
             fake2.close()
         finally:
             cs.close()
             fake.close()
+
+
+def test_see_canvas_reports_every_object_type_by_id():
+    """see_canvas lists each object kind (shape, fill, text, label) by id with
+    type-aware details; get_canvas composites all of them over the base."""
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "types.sock")
+        cs = CanvasServer(sock_path, width=16, height=8, background=(0, 0, 0))
+        cs.start()
+        try:
+            cs._apply_objects([
+                {"id": 1, "kind": "shape", "color": [255, 0, 0],
+                 "data": {"shape_type": "filled_rect", "x1": 0, "y1": 0,
+                          "x2": 2, "y2": 2, "thickness": 1},
+                 "pixels": [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1], [2, 1],
+                            [0, 2], [1, 2], [2, 2]]},
+                {"id": 2, "kind": "fill", "color": [0, 255, 0],
+                 "data": {"pixel_count": 3},
+                 "pixels": [[4, 4], [4, 5], [5, 5]]},
+                {"id": 3, "kind": "text", "color": [0, 0, 255],
+                 "data": {"text": "HI"}, "pixels": [[0, 6], [1, 6]]},
+                {"id": 4, "kind": "label", "color": [255, 255, 0],
+                 "data": {"lines": [[1, 8, "yo"]]}, "pixels": []},
+            ])
+            out = cs.see_canvas()
+            assert "objects:" in out
+            assert "shape 1: filled_rect (0,0)-(2,2) in #ff0000" in out
+            assert "fill 2: 3 pixels in #00ff00" in out
+            assert 'text 3: "HI" in #0000ff' in out
+            assert 'label 4: row 1, col 8: "yo" in #ffff00' in out
+            # get_canvas composites object pixels over the base; labels have none
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][1][0] == [255, 0, 0]   # shape at (0,1)
+            assert data["pixels"][4][4] == [0, 255, 0]   # fill at (4,4)
+            assert data["pixels"][6][1] == [0, 0, 255]   # text at (1,6)
+            assert data["pixels"][1][8] == [0, 0, 0]     # label paints nothing
+        finally:
+            cs.close()
 
 
 # --------------------------------------------------------------------------- #
