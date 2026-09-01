@@ -102,9 +102,9 @@
     width:10px; height:10px; border-radius:50%;
     background:var(--phos);
     box-shadow:var(--phos-glow);
-    opacity:0;
+    opacity:1;
+    animation:led 2.4s steps(2,end) infinite;
   }
-  .monitor.is-on .led{ opacity:1; animation:led 2.4s steps(2,end) infinite; }
 
   .screen{
     position:relative;
@@ -141,10 +141,8 @@
     flex-direction:column;
     flex:1;
     gap:18px;
-    opacity:0;
-    transform:translateY(6px);
+    opacity:1;
   }
-  .monitor.is-on .tui{ transition:opacity .5s ease .28s, transform .5s ease .28s; opacity:1; transform:none; }
 
   .boot .termline{ margin:0; }
   .termline{ color:var(--text); white-space:pre-wrap; word-break:break-word; }
@@ -320,10 +318,9 @@
     background:var(--phos);
     margin-left:5px;
     vertical-align:1px;
-    opacity:0;
+    opacity:1;
     box-shadow:var(--phos-glow);
   }
-  .monitor.is-on .pwr b{ opacity:1; }
 
   /* ---------- colophon ---------- */
   .colophon{
@@ -390,8 +387,7 @@
   }
 
   @media (prefers-reduced-motion: reduce){
-    .cursor, .led, .monitor.is-on .led{ animation:none !important; }
-    .monitor.is-on .tui{ transition:none; }
+    .cursor, .led, .pwr b{ animation:none !important; }
   }
 
   @media (max-width:560px){
@@ -422,7 +418,7 @@
         <div class="tui" id="tui">
           <div class="boot">
             <p class="termline">corvuspixel/01 · 100×100 · tty0</p>
-            <p class="termline dim" id="bootLine">establishing secure session<span class="cursor" id="bootCursor"></span></p>
+            <p class="termline dim" id="bootWrap"><span id="bootText">establishing secure session</span><span class="cursor" aria-hidden="true"></span></p>
           </div>
 
           <form class="consent" id="consent" novalidate>
@@ -493,25 +489,18 @@
   const PIX_B64 = "IAwhDCIMIwwkDCUMJgwnDCgMKQwqDCsMLAwtDC4MLwwwDDEMMgwzDDQMNQw2DDcMOAw5DDoMOww8DD0MPgw/DEAMQQxCDEMMRAxFDEYMIA1GDSAORg4gD0YPIBAiECMQJBAlECYQJxAoECkQKhArECwQLRAuEC8QMBAxEDIQMxA0EDUQNhA3EDgQORA6EDsQPBA9ED4QPxBAEEEQQhBDEEQQRhAgESIRRBFGESASIhJEEkYSIBMiE0QTRhMgFCIURBRGFCAVIhVEFUYVIBYiFiMWJBYlFiYWJxYoFikWKhYrFiwWLRYuFi8WMBYxFjIWMxY0FjUWNhY3FjgWORY6FjsWPBY9Fj4WPxZAFkEWQhZDFkQWRhYgF0YXIBgiGCMYJBglGCYYJxgoGCkYKhgrGCwYLRguGC8YMBgxGDIYMxg0GDUYNhg3GDgYORg6GDsYPBg9GD4YPxhAGEEYQhhDGEQYRhggGSIZRBlGGSAaIhpEGkYaIBsiG0QbRhsgHCIcRBxGHCAdIh1EHUYdIB4iHiMeJB4lHiYeJx4oHikeKh4rHiweLR4uHi8eMB4xHjIeMx40HjUeNh43HjgeOR46HjsePB49Hj4ePx5AHkEeQh5DHkQeRh4gH0YfICAiICMgJCAlIEYgICEiISUhRiEgIiIiJSJGIiAjIiMlI0YjICQiJCMkJCQlJEYkICVGJSAmRiYgJ0YnICgiKCMoJCglKCYoJygoKCkoKigrKCwoLSguKC8oMCgxKDIoMyg0KDUoNig3KDgoOSg6KDsoPCg9KD4oPyhAKEEoQihDKEQoRiggKSIpIykkKSUpJiknKSgpKSkqKSspLCktKS4pLykwKTEpMikzKTQpNSk2KTcpOCk5KTopOyk8KT0pPik/KUApQSlCKUMpRClGKSAqIipEKkYqICsiK0QrRisgLCIsJCxELEYsIC0iLSQtRC1GLSAuIi4lLicuKC4pLiouKy4sLi0uLi4vLjAuMS4yLjMuNC41LjYuNy44LjkuOi47LjwuPS4+Lj8uQC5BLkIuRC5GLiAvIi8lLycvKC8pLyovKy8sLy0vLi8vLzAvMS8yLzMvNC81LzYvNy84LzkvOi87LzwvPS8+Lz8vQC9BL0IvRC9GLyAwIjAkMEQwRjAgMSIxJDFEMUYxIDIiMkQyRjIgMyIzRDNGMyA0IjRENEY0IDUiNUQ1RjUgNiI2JDYlNiY2JzYoNik2KjYrNiw2LTYuNi82MDYxNjI2MzY0NjU2NjY3Njg2OTY6Njs2PDY9Nj42PzZANkE2QjZENkY2IDciNyQ3JTcmNyc3KDcpNyo3KzcsNy03LjcvNzA3MTcyNzM3NDc1NzY3Nzc4Nzk3Ojc7Nzw3PTc+Nz83QDdBN0I3RDdGNyA4IjhEOEY4IDkiOUQ5RjkgOiI6RDpGOiA7IjtEO0Y7IDwiPCQ8JTwmPCc8KDwpPCo8KzwsPC08LjwvPDA8MTwyPDM8NDw1PDY8Nzw4PDk8Ojw7PDw8PTw+PD88QDxBPEI8RDxGPCA9Ij0kPSU9Jj0nPSg9KT0qPSs9LD0tPS49Lz0wPTE9Mj0zPTQ9NT02PTc9OD05PTo9Oz08PT09Pj0/PUA9QT1CPUQ9Rj0gPiI+RD5GPiA/Ij9EP0Y/IEAiQERARkAgQSJBREFGQSBCIkIkQiVCJkInQihCKUIqQitCLEItQi5CL0IwQjFCMkIzQjRCNUI2QjdCOEI5QjpCO0I8Qj1CPkI/QkBCQUJCQkRCRkIgQyJDJEMlQyZDJ0MoQylDKkMrQyxDLUMuQy9DMEMxQzJDM0M0QzVDNkM3QzhDOUM6QztDPEM9Qz5DP0NAQ0FDQkNEQ0ZDIEQiRERERkQgRSJFREVGRSBGIkYjRiRGJUYmRidGKEYpRipGK0YsRi1GLkYvRjBGMUYyRjNGNEY1RjZGN0Y4RjlGOkY7RjxGPUY+Rj9GQEZBRkJGQ0ZERkZGIEciRyNHJEclRyZHJ0coRylHKkcrRyxHLUcuRy9HMEcxRzJHM0c0RzVHNkc3RzhHOUc6RztHPEc9Rz5HP0dAR0FHQkdDR0RHRkcgSEZIIElGSSBKIkojSiRKJUomSidKKEopSipKK0osSi1KLkovSjBKMUoySjNKNEo1SjZKN0o4SjlKOko7SjxKPUo+Sj9KQEpBSkJKQ0pESkZKIEsiS0RLRksgTCJMRExGTCBNIk1ETUZNIE4iTkRORk4gTyJPRE9GTyBQIlAjUCRQJVAmUCdQKFApUCpQK1AsUC1QLlAvUDBQMVAyUDNQNFA1UDZQN1A4UDlQOlA7UDxQPVA+UD9QQFBBUEJQQ1BEUEZQIFFGUSBSRlIgU0ZTIFQhVCJUI1QkVCVUJlQnVChUKVQqVCtULFQtVC5UL1QwVDFUMlQzVDRUNVQ2VDdUOFQ5VDpUO1Q8VD1UPlQ/VEBUQVRCVENURFRFVEZU";
 
   const monitor = document.getElementById('monitor');
-  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  // Boot: type the status line, then switch the monitor on.
-  const bootLine = document.getElementById('bootLine');
-  const bootCursor = document.getElementById('bootCursor');
+  const bootText = document.getElementById('bootText');
   const text = "establishing secure session";
-  if (reduced) {
-    bootLine.textContent = text;
-    bootCursor.remove();
-    monitor.classList.add('is-on');
-  } else {
+
+  // The form is already fully visible; the typewriter below is cosmetic only.
+  monitor.classList.add('is-on');
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    bootText.textContent = "";
     let i = 0;
     const type = setInterval(() => {
       i++;
-      bootLine.textContent = text.slice(0, i);
-      if (i >= text.length) {
-        clearInterval(type);
-        setTimeout(() => { bootCursor.remove(); monitor.classList.add('is-on'); }, 320);
-      }
+      bootText.textContent = text.slice(0, i);
+      if (i >= text.length) clearInterval(type);
     }, 34);
   }
 
