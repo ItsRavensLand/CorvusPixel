@@ -50,6 +50,10 @@ session it just says "Canvas already open in this session."
   a dimmed preview follows the cursor, release commits the shape in the current
   color, Escape cancels it.
 - **Keyboard**
+  - A live reminder of all these shortcuts sits in the bottom-left corner of the
+    window, packed into small labelled groups (move / draw / brush / shapes /
+    canvas / other); it shrinks on narrow windows and disappears when there is
+    no room.
   - arrow keys — move the cursor (a blinking reverse-video block framed by
     `[ ]` brackets, so it stays visible even on an empty canvas)
   - `space` — paint the pixels at the cursor with the current color

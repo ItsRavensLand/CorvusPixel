@@ -28,7 +28,10 @@ draw:
   vertically) and re-centered when the terminal is resized (SIGWINCH). The
   cursor is a blinking reverse-video block framed by ``[ ]`` brackets so its
   position is unambiguous even on an empty canvas (where reverse video would be
-  invisible because fg == bg).
+  invisible because fg == bg). A compact keyboard-shortcut panel sits in the
+  bottom-left margin of the chrome, packed into labelled groups (move / draw /
+  brush / shapes / canvas / other); it shrinks on narrow windows and disappears
+  if there is no room.
 
 Rendering: each logical pixel is drawn as ``CELL_W`` (2) terminal columns of a
 half-block ``▀``, so one display cell spans two canvas rows *and* two terminal
@@ -222,6 +225,18 @@ _SHAPE_SPEC: list[tuple[str, str, str, str]] = [
     ("line", "[Line]", "╱", "_tool_line"),
 ]
 
+# The keyboard-shortcut help panel in the bottom-left margin of the chrome:
+# (group header, keys). Packed into the palette/quick-colour rows' left margin
+# (``_shortcuts_panel``), most useful groups first; see the panel's docstring.
+_SHORTCUT_GROUPS: list[tuple[str, list[str]]] = [
+    ("Move", ["←↑↓→"]),
+    ("Draw", ["space", "x", "e"]),
+    ("Brush", ["+", "−"]),
+    ("Shapes", ["p", "r", "o", "f", "s", "l"]),
+    ("Canvas", ["[ ]", "{ }", "Tab"]),
+    ("Other", ["c", "1-8", "q"]),
+]
+
 # In-progress shapes preview at 40% of the tool colour so they clearly read as
 # uncommitted ghosts.
 PREVIEW_DIM = 0.4
@@ -393,6 +408,7 @@ class CanvasApp:
         self._pending_chrome = False  # next input only touches the chrome, not canvas
         self._old_palette_key: tuple[Any, ...] | None = None
         self._old_quick_key: tuple[Any, ...] | None = None
+        self._old_panel: tuple[Any, ...] | None = None
         self._old_cursor_cell: tuple[int, int] | None = None
         self._cursor_was_reversed = False
         self._blink_active = self._blink_on()
@@ -622,6 +638,7 @@ class CanvasApp:
     def _render_quick_colors(self, layout: dict[str, int], geom: dict[str, int]) -> None:
         """Draw the quick-colour swatch row; the custom swatch is a rainbow block."""
         file = self._console.file
+        self._old_panel = None  # the full-row clear below wipes the shortcuts panel
         file.write(f"\x1b[{geom['row']};1H\x1b[2K")
         for i, (_name, color) in enumerate(QUICK_COLORS):
             left = geom["indent"] + i * (geom["swatch_w"] + geom["gap"])
@@ -643,6 +660,68 @@ class CanvasApp:
             file.write(HALF_BLOCK)
             file.write(RESET)
 
+    def _shortcuts_panel(self, avail: int) -> list[list[tuple[str, str]]]:
+        """Pack the shortcut groups into panel lines of at most ``avail`` columns.
+
+        Each returned entry is one panel row (drawn top-down on the
+        palette-indicator, palette and quick-colour rows): a list of
+        ``(header, caption)`` pairs in display order. Groups stay in the order
+        they appear in ``_SHORTCUT_GROUPS`` (most useful first); a group too
+        wide to fit on a line by itself, or one that would spill onto a fourth
+        line, is dropped rather than wrapping or colliding with the swatches.
+        Returns ``[]`` when the left margin is too narrow to be legible.
+        """
+        if avail < 9:
+            return []
+        lines: list[list[tuple[str, str]]] = []
+        current: list[tuple[str, str]] = []
+        current_w = 0
+        for header, keys in _SHORTCUT_GROUPS:
+            caption = "·".join(keys)
+            if len(header) + 1 + len(caption) > avail:
+                continue  # never fits on a line by itself: drop it
+            add = len(header) + 1 + len(caption) + (2 if current else 0)
+            if current and current_w + add > avail:
+                lines.append(current)
+                current, current_w = [], 0
+                if len(lines) == 3:
+                    break  # the panel has exactly three chrome rows to use
+                add -= 2  # a fresh line's first group has no separator
+            current.append((header, caption))
+            current_w += add
+        if current and len(lines) < 3:
+            lines.append(current)
+        return lines
+
+    def _draw_shortcuts_panel(self, layout: dict[str, int]) -> None:
+        """Draw the grouped keyboard-shortcut panel into the bottom-left.
+
+        The panel packs ``_SHORTCUT_GROUPS`` into the left margin of the three
+        chrome rows below the canvas, so it never overlaps the centred swatches
+        (every line is bounded by the quick-colour row's indent). Only the
+        swatch renders clear these rows (and they invalidate ``_old_panel``), so
+        the panel redraws exactly when its rows are wiped — a brush-bar drag that
+        changes nothing else stays a true no-op.
+        """
+        geom = self._quick_geometry(layout)
+        avail = geom["indent"] - 2  # the margin before the quick-colour swatches
+        panel = self._shortcuts_panel(avail)
+        key = tuple(tuple(line) for line in panel)
+        if not panel:
+            self._old_panel = key
+            return
+        if key == self._old_panel:
+            return
+        self._old_panel = key
+        file = self._console.file
+        for i, line in enumerate(panel):
+            row = layout["top_pad"] + 3 + layout["canvas_rows"] + i
+            text = "  ".join(
+                f"{self._styled(header, '#7fd4ff')} {caption}"
+                for header, caption in line
+            )
+            file.write(f"\x1b[{row};1H{text}{RESET}")
+
     def _palette_geometry(self, layout: dict[str, int] | None = None) -> dict[str, int]:
         """Row/column layout of the visual color palette."""
         layout = layout or self._compute_layout()
@@ -661,6 +740,7 @@ class CanvasApp:
     def _render_palette_rows(self, layout: dict[str, int], geom: dict[str, int]) -> None:
         """Draw the swatch row plus a ``▼`` marker over the selected swatch."""
         file = self._console.file
+        self._old_panel = None  # the full-row clears below wipe the shortcuts panel
         file.write(f"\x1b[{geom['indicator_row']};1H\x1b[2K")
         file.write(f"\x1b[{geom['row']};1H\x1b[2K")
         if self._palette_active:
@@ -757,6 +837,7 @@ class CanvasApp:
         self._old_toolbar = ""
         self._old_palette_key = None
         self._old_quick_key = None
+        self._old_panel = None
         self._old_cursor_cell = None
         self._cursor_was_reversed = False
         self._draw_body()
@@ -834,6 +915,8 @@ class CanvasApp:
         if quick_key != self._old_quick_key:
             self._old_quick_key = quick_key
             self._render_quick_colors(layout, qgeom)
+
+        self._draw_shortcuts_panel(layout)
 
         # Park the terminal cursor below everything so it never wanders.
         park = min(layout["term_h"], layout["top_pad"] + 6 + layout["canvas_rows"])
@@ -954,6 +1037,8 @@ class CanvasApp:
             if quick_key != self._old_quick_key:
                 self._old_quick_key = quick_key
                 self._render_quick_colors(layout, qgeom)
+
+            self._draw_shortcuts_panel(layout)
 
             # Park the terminal cursor below everything so it never wanders.
             park = min(layout["term_h"], layout["top_pad"] + 6 + layout["canvas_rows"])

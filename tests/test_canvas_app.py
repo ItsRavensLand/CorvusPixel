@@ -1290,3 +1290,75 @@ def test_top_line_has_header_and_shape_buttons():
     app._icons = True
     top = app._render_top_line()
     assert "■" in top and "╱" in top  # shape icons when the terminal supports them
+
+
+# --------------------------------------------------------------------------- #
+# Bottom-left keyboard-shortcut panel
+# --------------------------------------------------------------------------- #
+
+
+def wide_app() -> CanvasApp:
+    """A make_app on a 170-col terminal so every shortcut group fits."""
+    return make_app((170, 40))
+
+
+def test_shortcuts_panel_full_grouping_on_wide_terminal():
+    app = wide_app()
+    # The quick-colour row leaves a 57-column left margin: all six groups fit,
+    # packed into lines with a short labelled header per group.
+    assert app._shortcuts_panel(avail=57) == [
+        [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−"),
+         ("Shapes", "p·r·o·f·s·l")],
+        [("Canvas", "[ ]·{ }·Tab"), ("Other", "c·1-8·q")],
+    ]
+
+
+def test_shortcuts_panel_packs_by_width_keeping_group_order():
+    app = make_app()  # 80 cols -> 12-column left margin
+    # Groups stay in priority order and overflow is dropped, never wrapped.
+    assert app._shortcuts_panel(avail=12) == [
+        [("Move", "←↑↓→")],
+        [("Brush", "+·−")],
+    ]
+
+
+def test_shortcuts_panel_hidden_when_margin_too_narrow():
+    app = make_app()
+    assert app._shortcuts_panel(avail=8) == []
+
+
+def test_shortcuts_panel_renders_bottom_left():
+    app = wide_app()
+    rendered = app._console.file.getvalue()
+    for header in ("Move", "Draw", "Brush", "Shapes", "Canvas", "Other"):
+        assert header in rendered
+    assert "space·x·e" in rendered
+    assert "p·r·o·f·s·l" in rendered
+    assert "c·1-8·q" in rendered
+    # Left-aligned on the palette-indicator row: the bottom-left corner.
+    layout = app._layout_info
+    panel_row = layout["top_pad"] + 3 + layout["canvas_rows"]
+    assert f"\x1b[{panel_row};1H" in rendered
+
+
+def test_shortcuts_panel_survives_a_colour_pick():
+    app = wide_app()
+    first = len(app._console.file.getvalue())
+    app._handle_char("c")  # cycle colour: the palette row redraws, wiping the panel
+    app._after_edit([])
+    delta = app._console.file.getvalue()[first:]
+    assert "space·x·e" in delta  # the panel is redrawn in the same pass
+
+
+def test_shortcuts_panel_not_rewritten_on_noop_redraw():
+    app = wide_app()
+    out = app._console.file
+    s = app._toolbar_geometry()["slider"]
+    app._handle_csi(f"<0;{s.col + 2};{s.row}", "M")  # size 3: a real chrome change
+    app._after_edit([])
+    first = len(out.getvalue())
+    app._handle_csi(f"<32;{s.col + 2};{s.row}", "M")  # same slot: nothing changed
+    app._after_edit([])
+    delta = out.getvalue()[first:]
+    assert "space·x·e" not in delta  # panel is diffed: not rewritten
+    assert "\x1b[38;2;" not in delta  # no header recolour either

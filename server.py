@@ -355,6 +355,10 @@ class RendererSink:
         except FileNotFoundError:
             pass
         self._server.bind(self._socket_path)
+        # The socket path is created with the process umask (usually 0755), which
+        # on a multi-user machine would let any local user connect and draw.
+        # Restrict it to the owner so only this session's windows can connect.
+        os.chmod(self._socket_path, 0o600)
         self._server.listen(4)
         self._accept_thread = threading.Thread(
             target=self._accept_loop, name="corvuspixel-accept", daemon=True

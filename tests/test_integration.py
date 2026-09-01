@@ -6,7 +6,9 @@ Run with:  .venv/bin/python -m pytest
 import asyncio
 import io
 import json
+import os
 import socket
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -128,6 +130,20 @@ def test_canvas_status_reflects_live_windows() -> None:
         finally:
             cs.close()
             fake.close()
+
+
+def test_socket_file_is_owner_only() -> None:
+    """The session socket is chmod'ed to 0600 right after bind(), so other
+    local users on a multi-user system cannot connect to it."""
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "perms.sock")
+        cs = CanvasServer(sock_path, width=4, height=4, background=(0, 0, 0))
+        cs.start()
+        try:
+            mode = stat.S_IMODE(os.stat(sock_path).st_mode)
+            assert mode == 0o600
+        finally:
+            cs.close()
 
 
 def test_server_applies_user_edits_and_broadcasts() -> None:
