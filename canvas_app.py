@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import signal
@@ -116,6 +117,14 @@ BRUSH_MIN = 1
 BRUSH_MAX = 7  # square brush side lengths: 1x1 .. 7x7
 MIN_CANVAS = 1
 MAX_CANVAS = 100
+
+# Coalesce a burst of resize keypresses: a grow/shrink is applied locally
+# instantly but its ``resize`` message is only sent once this many seconds pass
+# without another resize, so holding ``]`` doesn't flood the server with one
+# full snapshot per keypress.
+RESIZE_DEBOUNCE_S = 0.04
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SOCKET = os.environ.get("CORVUSPIXEL_SOCK", "/tmp/corvuspixel.sock")
 
@@ -692,6 +701,10 @@ class CanvasApp:
         self._brush_size = 1
         self._text_scale = 1  # text renders each font pixel as an NxN block
         self._pending_resize: tuple[int, int] | None = None
+        # Debounced server sync for a resize: the requested size once it stops
+        # changing, and when it may be sent (``_pump`` flushes it then).
+        self._queued_resize: tuple[int, int] | None = None
+        self._resize_send_deadline: float | None = None
 
         # In-progress shape drag: start/end canvas cells and the local (never
         # sent) preview overlay. Empty until a shape tool is dragged.
@@ -859,11 +872,25 @@ class CanvasApp:
         self._force_full = True
 
     def _pump(self) -> None:
-        """Periodic upkeep: cursor blink + terminal-resize repaint."""
-        blink = self._blink_on()
-        if blink != self._blink_active or self._force_full:
-            self._blink_active = blink
-            self._draw()
+        """Periodic upkeep: cursor blink + terminal-resize repaint.
+
+        Best-effort: this runs on every idle socket tick, so an unexpected
+        error must never take down the main loop — log and move on."""
+        try:
+            blink = self._blink_on()
+            if blink != self._blink_active or self._force_full:
+                self._blink_active = blink
+                self._draw()
+            # Flush a debounced resize once it stops changing. Main thread
+            # only, so the socket write can't race another resize.
+            if (self._queued_resize is not None
+                    and self._resize_send_deadline is not None
+                    and time.monotonic() >= self._resize_send_deadline):
+                self._send_resize(*self._queued_resize)
+                self._queued_resize = None
+                self._resize_send_deadline = None
+        except Exception:
+            logger.exception("error in pump")
 
     # -- socket message handling ---------------------------------------------
 
@@ -904,18 +931,20 @@ class CanvasApp:
 
     def _clip_objects_to_canvas(self) -> None:
         """Clip every pixel object to the current canvas, dropping empties.
-        Labels are an overlay and are left untouched."""
-        kept: list[Object] = []
-        for obj in self._objects:
-            if obj.kind != "label":
-                obj.pixels = {
-                    (x, y) for (x, y) in obj.pixels
-                    if 0 <= x < self._width and 0 <= y < self._height
-                }
-                if not obj.pixels:
-                    continue
-            kept.append(obj)
-        self._objects = kept
+        Labels are an overlay and are left untouched. Runs under the state lock
+        (mutates object pixels; a concurrent ``_render_color`` iterates them)."""
+        with self._lock:
+            kept: list[Object] = []
+            for obj in self._objects:
+                if obj.kind != "label":
+                    obj.pixels = {
+                        (x, y) for (x, y) in obj.pixels
+                        if 0 <= x < self._width and 0 <= y < self._height
+                    }
+                    if not obj.pixels:
+                        continue
+                kept.append(obj)
+            self._objects = kept
 
     # -- drawing ---------------------------------------------------------------
 
@@ -1658,7 +1687,12 @@ class CanvasApp:
         """Flood-fill the connected same-colour region at (x, y) with the
         current color, as ONE fill object (a single objects sync, not a pixel
         edit). The fill sees the composite — base + objects — so overlapping
-        content is a wall for the fill."""
+        content is a wall for the fill. Runs under the state lock."""
+        with self._lock:
+            return self._flood_fill_unlocked(x, y)
+
+    def _flood_fill_unlocked(self, x: int, y: int) -> list[dict[str, Any]]:
+        """The actual fill; the caller must hold ``self._lock``."""
         if not (0 <= x < self._width and 0 <= y < self._height):
             return []
         grid = [[self._render_color(px, py) for px in range(self._width)]
@@ -1685,7 +1719,16 @@ class CanvasApp:
         return self._paint(self._cursor_x, self._cursor_y, self._background)
 
     def _resize_local(self, new_w: int, new_h: int) -> None:
-        """Resize the local copy, keeping the top-left region where it fits."""
+        """Resize the local copy, keeping the top-left region where it fits.
+
+        Runs under the state lock: it swaps ``_pixels`` for a shorter list, and
+        without the lock a concurrent render (main thread) could index a stale
+        row and hard-crash the app."""
+        with self._lock:
+            self._resize_local_unlocked(new_w, new_h)
+
+    def _resize_local_unlocked(self, new_w: int, new_h: int) -> None:
+        """The actual local resize; the caller must hold ``self._lock``."""
         old = self._pixels
         old_w, old_h = self._width, self._height
         self._width, self._height = new_w, new_h
@@ -2906,7 +2949,18 @@ class CanvasApp:
         self._pending_chrome = True
 
     def _handle_char(self, ch: str) -> list[dict[str, Any]]:
-        """Handle a plain (non-escape) key. Returns the pixel changes, if any."""
+        """Handle a plain (non-escape) key. Returns the pixel changes, if any.
+
+        Runs under the state lock: the input thread applies edits (paint,
+        shapes, fills, resizes) to the same ``_pixels``/``_objects`` the main
+        thread's ``_apply``/``_draw`` read, and unsynchronized mutation is what
+        let a rapid resize swap ``_pixels`` out from under a concurrent render
+        (IndexError -> the terminal hard-crashed)."""
+        with self._lock:
+            return self._handle_char_unlocked(ch)
+
+    def _handle_char_unlocked(self, ch: str) -> list[dict[str, Any]]:
+        """The actual key handling; the caller must hold ``self._lock``."""
         if self._custom_color_mode:
             if ch in "0123456789abcdefABCDEF" and len(self._hex_buffer) < 6:
                 self._hex_buffer += ch.lower()
@@ -3006,7 +3060,16 @@ class CanvasApp:
         return []
 
     def _handle_csi(self, params: str, final: str) -> list[dict[str, Any]]:
-        """Handle one CSI sequence. Returns the pixel changes, if any."""
+        """Handle one CSI sequence. Returns the pixel changes, if any.
+
+        Runs under the state lock for the same reason as ``_handle_char``:
+        mouse clicks commit shapes, bucket fills and resizes, and those must not
+        race the main thread's locked render."""
+        with self._lock:
+            return self._handle_csi_unlocked(params, final)
+
+    def _handle_csi_unlocked(self, params: str, final: str) -> list[dict[str, Any]]:
+        """The actual CSI handling; the caller must hold ``self._lock``."""
         if final in ("A", "B", "C", "D"):
             if self._custom_color_mode:
                 return []  # arrows do nothing mid hex input
@@ -3046,14 +3109,15 @@ class CanvasApp:
         except (OSError, ValueError):
             return []
         if second != b"[":
-            if self._custom_color_mode:
-                self._exit_custom_color()  # a stray Esc cancels the hex input
-            if self._shape_drag is not None:
-                self._cancel_shape_drag()  # a stray Esc cancels an in-progress shape
-            if self._text_active:
-                return self._text_cancel()  # a stray Esc reverts the text session
-            if self._label_active:
-                return self._label_cancel()  # a stray Esc cancels the label session
+            with self._lock:
+                if self._custom_color_mode:
+                    self._exit_custom_color()  # a stray Esc cancels the hex input
+                if self._shape_drag is not None:
+                    self._cancel_shape_drag()  # a stray Esc cancels an in-progress shape
+                if self._text_active:
+                    return self._text_cancel()  # a stray Esc reverts the text session
+                if self._label_active:
+                    return self._label_cancel()  # a stray Esc cancels the label session
             return []  # Alt+key or a stray ESC: ignore
         buf = ""
         while True:
@@ -3081,14 +3145,25 @@ class CanvasApp:
                 self._quit.set()
                 break
             if first == b"\x1b":
-                changes = self._read_escape_sequence()
+                try:
+                    changes = self._read_escape_sequence()
+                except Exception:
+                    logger.exception("ignoring bad escape sequence")
+                    changes = []
             else:
                 try:
                     ch = first.decode("utf-8")
                 except UnicodeDecodeError:
                     continue
-                changes = self._handle_char(ch)
-            self._after_edit(changes)
+                try:
+                    changes = self._handle_char(ch)
+                except Exception:
+                    logger.exception("ignoring bad key input: %r", first)
+                    changes = []
+            try:
+                self._after_edit(changes)
+            except Exception:
+                logger.exception("error after edit")
 
     def _after_edit(self, changes: list[dict[str, Any]]) -> None:
         """Redraw and sync any edits/resizes to the server."""
@@ -3103,7 +3178,12 @@ class CanvasApp:
                 self._draw()
             self._send_edit(changes)
             if self._pending_resize is not None:
-                self._send_resize(*self._pending_resize)
+                # Debounce: the resize was already applied locally for instant
+                # feedback; the server sync waits until the size stops
+                # changing, so a burst of ``[``/``]`` keypresses coalesces into
+                # one ``resize`` message instead of one full snapshot each.
+                self._queued_resize = self._pending_resize
+                self._resize_send_deadline = time.monotonic() + RESIZE_DEBOUNCE_S
                 self._pending_resize = None
 
     def _send_edit(self, changes: list[dict[str, Any]]) -> None:
@@ -3204,7 +3284,14 @@ class CanvasApp:
                     message = json.loads(line.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                self._apply(message)
+                # A message must never take down the window: an unexpected
+                # error while applying it (e.g. a stale snapshot racing a
+                # resize) logs and drops just that message, and the next one
+                # (or the periodic full redraw) re-syncs.
+                try:
+                    self._apply(message)
+                except Exception:
+                    logger.exception("ignoring bad server message: %r", message)
                 self._pump()
 
     def run(self) -> None:

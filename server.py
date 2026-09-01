@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import logging
 import math
 import os
 import platform
@@ -32,6 +33,8 @@ from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # Protocol / shared helpers
@@ -411,18 +414,24 @@ class RendererSink:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if message.get("type") == "edit" and self._on_edit is not None:
-                    changes = [
-                        CellChange(c["x"], c["y"], tuple(c["color"]))
-                        for c in message.get("changes", [])
-                    ]
-                    self._on_edit(changes)
-                elif message.get("type") == "resize" and self._on_resize is not None:
-                    w, h = message.get("width"), message.get("height")
-                    if isinstance(w, int) and isinstance(h, int):
-                        self._on_resize(w, h)
-                elif message.get("type") == "objects" and self._on_objects is not None:
-                    self._on_objects(message.get("objects", []))
+                # One bad message from a window (e.g. a resize racing the local
+                # objects list) must not drop that window's connection: log and
+                # keep reading.
+                try:
+                    if message.get("type") == "edit" and self._on_edit is not None:
+                        changes = [
+                            CellChange(c["x"], c["y"], tuple(c["color"]))
+                            for c in message.get("changes", [])
+                        ]
+                        self._on_edit(changes)
+                    elif message.get("type") == "resize" and self._on_resize is not None:
+                        w, h = message.get("width"), message.get("height")
+                        if isinstance(w, int) and isinstance(h, int):
+                            self._on_resize(w, h)
+                    elif message.get("type") == "objects" and self._on_objects is not None:
+                        self._on_objects(message.get("objects", []))
+                except Exception:
+                    logger.exception("ignoring bad message from canvas window: %r", message)
         except OSError:
             pass
         finally:
@@ -542,16 +551,24 @@ class CanvasServer:
             self._publish(applied)
 
     def _resize_canvas(self, width: int, height: int) -> None:
-        """Resize the canvas from a window, preserving pixels that still fit."""
-        with self._lock:
-            width = max(1, min(width, 100))
-            height = max(1, min(height, 100))
-            if (width, height) == (self._canvas.width, self._canvas.height):
-                return
-            self._canvas.resize(width, height)
-            self._clip_objects(width, height)
-            # Dimensions changed: every window must re-sync from a fresh snapshot.
-            self._sink.push({"type": "full", **self.snapshot()})
+        """Resize the canvas from a window, preserving pixels that still fit.
+
+        Best-effort: an unexpected error here must not kill the server — the
+        errant resize is logged and ignored, and the next resize or full
+        snapshot re-syncs the window."""
+        try:
+            with self._lock:
+                width = max(1, min(width, 100))
+                height = max(1, min(height, 100))
+                if (width, height) == (self._canvas.width, self._canvas.height):
+                    return
+                self._canvas.resize(width, height)
+                self._clip_objects(width, height)
+                # Dimensions changed: every window must re-sync from a fresh
+                # snapshot.
+                self._sink.push({"type": "full", **self.snapshot()})
+        except Exception:
+            logger.exception("ignoring bad resize %sx%s", width, height)
 
     def _clip_objects(self, width: int, height: int) -> None:
         """Clip every pixel object's pixels to the new canvas size, dropping

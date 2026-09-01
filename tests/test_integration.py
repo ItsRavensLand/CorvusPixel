@@ -356,6 +356,67 @@ def test_see_canvas_reports_every_object_type_by_id():
             cs.close()
 
 
+def test_fill_survives_resize_over_socket() -> None:
+    """A bucket fill sent as an object survives a window resize on the server:
+    growing leaves it unchanged, shrinking clips it to the new bounds — the
+    same guarantee shape objects get — and the composite still shows it."""
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "fill_resize.sock")
+        cs = CanvasServer(sock_path, width=16, height=8, background=(0, 0, 0))
+        cs.start()
+        fake = FakeRenderer(sock_path)
+        try:
+            fake.connect()
+            fake.read_message()  # the initial full snapshot
+
+            # A window commits a fill covering the whole canvas, then a small
+            # shape on top of it (later objects render on top).
+            app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            app.connect(sock_path)
+            app.sendall((json.dumps({
+                "type": "objects",
+                "objects": [
+                    {"id": 1, "kind": "fill", "color": [0, 255, 0],
+                     "data": {"pixel_count": 128},
+                     "pixels": [[x, y] for x in range(16) for y in range(8)]},
+                    {"id": 2, "kind": "shape", "color": [255, 0, 0],
+                     "data": {"shape_type": "filled_rect", "x1": 0, "y1": 0,
+                              "x2": 1, "y2": 1, "thickness": 1},
+                     "pixels": [[0, 0], [1, 0], [0, 1], [1, 1]]},
+                ],
+            }) + "\n").encode())
+            fake.read_message()  # objects echo
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][1][15] == [0, 255, 0]  # fill covers the canvas
+            assert data["pixels"][0][0] == [255, 0, 0]   # shape paints on top
+
+            # GROW to 20x10: both objects keep every pixel.
+            app.sendall((json.dumps({"type": "resize", "width": 20, "height": 10}) + "\n").encode())
+            msg = fake.read_message()
+            assert msg["type"] == "full"
+            assert msg["width"] == 20 and msg["height"] == 10
+            assert [o["id"] for o in msg["objects"]] == [1, 2]
+            assert len(msg["objects"][0]["pixels"]) == 128  # fill unchanged
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][1][15] == [0, 255, 0]     # still rendered
+
+            # SHRINK to 8x4: the fill clips to the new bounds like any object.
+            app.sendall((json.dumps({"type": "resize", "width": 8, "height": 4}) + "\n").encode())
+            msg = fake.read_message()
+            assert msg["type"] == "full"
+            assert msg["width"] == 8 and msg["height"] == 4
+            clipped = msg["objects"][0]["pixels"]
+            assert clipped and all(x < 8 and y < 4 for x, y in clipped)
+            assert len(clipped) == 32  # 8x4 of the original 16x8 fill
+            data = json.loads(cs.get_canvas())
+            assert data["pixels"][3][7] == [0, 255, 0]  # a still-fitting corner
+            assert data["pixels"][0][1] == [255, 0, 0]  # the shape survives too
+            app.close()
+        finally:
+            cs.close()
+            fake.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. Renderer: applies messages and draws only the cells that changed
 # --------------------------------------------------------------------------- #

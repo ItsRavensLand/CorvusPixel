@@ -13,6 +13,7 @@ import io
 import re
 import socket
 import string
+import threading
 
 from rich.console import Console
 
@@ -540,6 +541,121 @@ def test_resize_pending_is_sent_and_cleared():
     assert app._pending_resize == (5, 4)
     app._after_edit([])  # no socket in tests -> send is a no-op, flag still clears
     assert app._pending_resize is None
+
+
+# --------------------------------------------------------------------------- #
+# Resize robustness: fills survive resize; rapid resizes never crash
+# --------------------------------------------------------------------------- #
+
+
+def test_fill_survives_grow_and_shrink_resize():
+    """A committed bucket fill is a frozen pixel-set object: growing the canvas
+    leaves it exactly as it was and shrinking clips it to the new bounds — the
+    same guarantee shape objects have — via the real keyboard resize path."""
+    app = text_app()  # 40x16, the whole background is one connected region
+    app._color = (0, 255, 0)
+    app._tool = TOOL_FILL
+    app._flood_fill(2, 2)  # one click fills the whole background
+    fills = [o for o in app._objects if o.kind == "fill"]
+    assert len(fills) == 1
+    before = set(fills[0].pixels)
+    assert before and (2, 2) in before
+    assert app._render_color(2, 2) == (0, 255, 0)
+
+    # GROW: the fill keeps every pixel.
+    app._handle_char("]")
+    app._after_edit([])
+    assert app._width == 41
+    assert set([o for o in app._objects if o.kind == "fill"][0].pixels) == before
+    assert app._render_color(2, 2) == (0, 255, 0)
+
+    # SHRINK back to the original size: still unchanged.
+    app._handle_char("[")
+    app._after_edit([])
+    assert app._width == 40
+    assert set([o for o in app._objects if o.kind == "fill"][0].pixels) == before
+    assert app._render_color(2, 2) == (0, 255, 0)
+
+    # SHRINK below the fill's right edge: it clips, keeping what still fits.
+    for _ in range(15):
+        app._handle_char("[")
+        app._after_edit([])
+    assert app._width == 25
+    fill = [o for o in app._objects if o.kind == "fill"][0]
+    assert fill.pixels
+    assert all(x < 25 for x, _ in fill.pixels)  # nothing hangs past the edge
+    assert (2, 2) in fill.pixels
+    assert app._render_color(2, 2) == (0, 255, 0)
+
+
+def test_rapid_resize_spam_never_raises_and_stays_consistent():
+    """Spamming the grow/shrink shortcuts must never raise, and afterwards the
+    dimensions, pixel grid and every object stay mutually consistent."""
+    app = text_app()
+    app._color = (0, 255, 0)
+    app._tool = TOOL_FILL
+    app._flood_fill(0, 0)
+    assert app._objects
+    for i in range(400):
+        if i % 2:
+            app._request_resize(1, 0)
+        else:
+            app._request_resize(-1, 0)
+        if i % 2:
+            app._request_resize(0, 1)
+        else:
+            app._request_resize(0, -1)
+    assert MIN_CANVAS <= app._width <= MAX_CANVAS
+    assert MIN_CANVAS <= app._height <= MAX_CANVAS
+    assert len(app._pixels) == app._height
+    assert all(len(row) == app._width for row in app._pixels)
+    for o in app._objects:
+        assert all(0 <= x < app._width and 0 <= y < app._height for x, y in o.pixels)
+
+
+def test_rapid_resize_racing_render_does_not_crash():
+    """A resize storm in one thread while another renders must not crash. The
+    resize path holds the state lock, so a shrink can't swap ``_pixels`` out
+    from under a concurrent ``_draw`` — that used to IndexError, escape
+    ``run()``, and hard-close the terminal."""
+    app = text_app(width=100, height=60, term=(220, 130))
+    app._color = (0, 255, 0)
+    app._tool = TOOL_FILL
+    app._flood_fill(0, 0)
+    errors: list[str] = []
+    stop = threading.Event()
+
+    def spam() -> None:
+        try:
+            for i in range(800):
+                if stop.is_set():
+                    break
+                if i % 2:
+                    app._request_resize(1, 0)
+                else:
+                    app._request_resize(0, -1)
+        except Exception as e:  # pragma: no cover - failure path
+            errors.append(f"{type(e).__name__}: {e}")
+            stop.set()
+
+    def draw() -> None:
+        try:
+            while not stop.is_set():
+                app._draw()
+        except Exception as e:  # pragma: no cover - failure path
+            errors.append(f"{type(e).__name__}: {e}")
+            stop.set()
+
+    t1 = threading.Thread(target=spam, daemon=True)
+    t2 = threading.Thread(target=draw, daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(15)
+    t2.join(15)
+    stop.set()
+    assert errors == [], errors
+    assert len(app._pixels) == app._height
+    assert all(len(row) == app._width for row in app._pixels)
 
 
 # --------------------------------------------------------------------------- #
