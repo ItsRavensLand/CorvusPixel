@@ -237,6 +237,54 @@ def test_server_resizes_canvas_from_window_message() -> None:
             fake.close()
 
 
+def test_labels_sync_over_socket_and_see_canvas() -> None:
+    """Labels flow window -> server -> other windows, and show in see_canvas."""
+    with tempfile.TemporaryDirectory() as td:
+        sock_path = str(Path(td) / "labels.sock")
+        cs = CanvasServer(sock_path, width=8, height=8, background=(0, 0, 0))
+        cs.start()
+        fake = FakeRenderer(sock_path)
+        try:
+            fake.connect()
+            initial = fake.read_message()
+            assert initial["type"] == "full"
+            assert initial["labels"] == []
+
+            # A window broadcasts its annotations; the server stores them and
+            # pushes a labels message to every connected window.
+            app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            app.connect(sock_path)
+            app.sendall(
+                (json.dumps(
+                    {"type": "labels", "labels": [[0, 1, "HI", [255, 0, 0]]]}
+                ) + "\n").encode()
+            )
+            msg = fake.read_message()
+            assert msg["type"] == "labels"
+            assert msg["labels"] == [[0, 1, "HI", [255, 0, 0]]]
+
+            # see_canvas lists the annotations with position and color.
+            out = cs.see_canvas()
+            assert 'labels (terminal rows/cols):' in out
+            assert 'row 0, col 1: "HI" in #ff0000' in out
+
+            # A connecting window gets the labels in its fresh full snapshot.
+            fake.close()
+            fake2 = FakeRenderer(sock_path)
+            fake2.connect()
+            full = fake2.read_message()
+            assert full["labels"] == [[0, 1, "HI", [255, 0, 0]]]
+
+            # init_canvas resets the labels along with the pixels.
+            cs.reset(4, 4, (5, 5, 5))
+            assert "labels (terminal rows/cols):" not in cs.see_canvas()
+            app.close()
+            fake2.close()
+        finally:
+            cs.close()
+            fake.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. Renderer: applies messages and draws only the cells that changed
 # --------------------------------------------------------------------------- #

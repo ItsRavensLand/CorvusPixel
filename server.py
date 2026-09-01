@@ -332,6 +332,7 @@ class RendererSink:
         self._snapshot_provider: Callable[[], dict[str, Any]] | None = None
         self._on_edit: Callable[[list[CellChange]], None] | None = None
         self._on_resize: Callable[[int, int], None] | None = None
+        self._on_labels: Callable[[list[Any]], None] | None = None
         self._server: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._reader_threads: set[threading.Thread] = set()
@@ -345,10 +346,12 @@ class RendererSink:
         snapshot_provider: Callable[[], dict[str, Any]],
         on_edit: Callable[[list[CellChange]], None] | None = None,
         on_resize: Callable[[int, int], None] | None = None,
+        on_labels: Callable[[list[Any]], None] | None = None,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._on_edit = on_edit
         self._on_resize = on_resize
+        self._on_labels = on_labels
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             os.unlink(self._socket_path)  # clear a stale socket from a dead run
@@ -418,6 +421,8 @@ class RendererSink:
                     w, h = message.get("width"), message.get("height")
                     if isinstance(w, int) and isinstance(h, int):
                         self._on_resize(w, h)
+                elif message.get("type") == "labels" and self._on_labels is not None:
+                    self._on_labels(message.get("labels", []))
         except OSError:
             pass
         finally:
@@ -489,11 +494,18 @@ class CanvasServer:
         self._lock = threading.RLock()
         self._canvas = PixelCanvas(width, height, background)
         self._sink = RendererSink(socket_path)
+        # Terminal-text annotations shared with canvas windows, in (row, col,
+        # text, color) form with terminal-cell (not pixel) coordinates. Kept in
+        # sync with every connected window and shown by see_canvas().
+        self._labels: list[list[Any]] = []
 
     def start(self) -> None:
         """Start accepting canvas-window connections (call before ``server.run()``)."""
         self._sink.start(
-            self.snapshot, on_edit=self._apply_edits, on_resize=self._resize_canvas
+            self.snapshot,
+            on_edit=self._apply_edits,
+            on_resize=self._resize_canvas,
+            on_labels=self._apply_labels,
         )
 
     def close(self) -> None:
@@ -511,7 +523,7 @@ class CanvasServer:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return self._canvas.snapshot()
+            return {**self._canvas.snapshot(), "labels": self._labels}
 
     # -- user input coming back from a canvas window -------------------------
 
@@ -537,6 +549,28 @@ class CanvasServer:
             # Dimensions changed: every window must re-sync from a fresh snapshot.
             self._sink.push({"type": "full", **self._canvas.snapshot()})
 
+    def _apply_labels(self, labels: list[Any]) -> None:
+        """Store the annotation list sent by a canvas window and rebroadcast it,
+        so every connected window (and see_canvas) stays in sync."""
+        with self._lock:
+            cleaned: list[list[Any]] = []
+            for entry in labels:
+                if not (isinstance(entry, list) and len(entry) == 4):
+                    continue
+                row, col, text, color = entry
+                if not (isinstance(row, int) and isinstance(col, int)
+                        and isinstance(text, str)):
+                    continue
+                try:
+                    rgb = [int(c) for c in color]
+                except (TypeError, ValueError):
+                    continue
+                if len(rgb) != 3:
+                    continue
+                cleaned.append([row, col, text, rgb])
+            self._labels = cleaned
+            self._sink.push({"type": "labels", "labels": self._labels})
+
     # -- the eight tool bodies ----------------------------------------------
 
     def reset(self, width: int, height: int, background: Color) -> str:
@@ -544,6 +578,7 @@ class CanvasServer:
             width = max(1, min(width, 100))  # mirror the resize-path bounds
             height = max(1, min(height, 100))
             self._canvas = PixelCanvas(width, height, background)
+            self._labels = []  # a fresh canvas has no text annotations
             self._sink.push({"type": "full", **self._canvas.snapshot()})
             return (
                 f"canvas initialized to {width}x{height} "
@@ -581,7 +616,15 @@ class CanvasServer:
     def see_canvas(self) -> str:
         """Return a compact, token-cheap view of the canvas for the model."""
         with self._lock:
-            return compact_view(self._canvas)
+            out = compact_view(self._canvas)
+            if self._labels:
+                parts = ["labels (terminal rows/cols):"]
+                for row, col, text, color in self._labels:
+                    parts.append(
+                        f'  row {row}, col {col}: "{text}" in {hex_str(tuple(color))}'
+                    )
+                out += "\n" + "\n".join(parts)
+            return out
 
     def draw_default(self) -> str:
         """Draw the built-in smiley on the current canvas."""

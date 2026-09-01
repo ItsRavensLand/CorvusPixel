@@ -57,7 +57,15 @@ session it just says "Canvas already open in this session."
   makes chunkier, more readable text; changing it mid-typing only affects
   characters typed after the change) — Backspace erases the last character,
   Enter moves to a new line below, and Escape cancels the whole in-progress
-  session (click elsewhere or switch tools to finalize it).
+  session (click elsewhere or switch tools to finalize it). The **label** tool
+  (same top-right corner) is the literal-text counterpart: click to place a
+  caret at a single terminal character cell, type to write real terminal
+  characters in the terminal's own font — crisp at any size — right over the
+  pixel grid in the current color, Backspace removes the last character, Enter
+  starts a new line below, Escape cancels the whole in-progress label, and
+  clicking elsewhere or switching tools finalizes it. Labels are stored
+  separately from the pixels (as `(row, col, text, color)` annotations) and
+  show up in `see_canvas`.
 - **Keyboard**
   - A live reminder of all these shortcuts sits in the bottom-left corner of the
     window, packed into small labelled groups (move / draw / brush / shapes /
@@ -76,7 +84,10 @@ session it just says "Canvas already open in this session."
   - `b` — bucket fill: one click flood-fills the connected same-color region ·
     `t` — text tool: click to place the insertion point, type to draw,
     Backspace erases, Enter moves to a new line, Escape cancels the session;
-    while this tool is active the brush bar / `+` `-` set the text scale
+    while this tool is active the brush bar / `+` `-` set the text scale ·
+    `a` — label tool: click to place a terminal-cell caret, type literal
+    terminal characters right over the pixels, Backspace removes the last one,
+    Enter drops a line, Escape cancels the whole in-progress label
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
     the toolbar's brush bar does the same with the mouse). With the **text tool
     active** they set the text scale instead (each font pixel draws as an N×N

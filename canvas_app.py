@@ -13,7 +13,12 @@ draw:
   the text tool (a click places a text caret, typing draws in a small bitmap
   font, backspace erases, Enter starts a new line, Escape reverts the whole
   session, and the brush-size bar / ``+``/``-`` keys set the text scale while
-  the tool is active); ``+``/``-`` grow/shrink the square brush; ``[``/``]`` and
+  the tool is active); ``a`` selects the label tool (a click places a
+  terminal-cell caret, typing writes literal terminal characters in the
+  terminal's own font — crisp at any size — over the pixel grid, backspace
+  removes the last character, Enter starts a new line below, Escape cancels the
+  whole in-progress label, and clicking elsewhere or switching tools finalizes
+  it); ``+``/``-`` grow/shrink the square brush; ``[``/``]`` and
   ``{``/``}`` grow/shrink the canvas (columns at the right edge, rows at the
   bottom edge); ``c`` cycles the palette; ``1``-``8`` pick a palette color;
   ``Tab`` opens the visual palette (arrow keys + Enter/space select); ``q`` or
@@ -29,8 +34,13 @@ draw:
   where you click; typing draws each character in the current colour (the
   brush-size bar doubles as the text-scale control while this tool is active),
   backspace erases the last character, Enter starts a new line below, and
-  Escape reverts everything typed in this session. Clicking (or click-dragging)
-  on the canvas
+  Escape reverts everything typed in this session. The label tool (also in the
+  top-right corner) is the literal-text counterpart: click to place a
+  terminal-cell caret, type to write real terminal characters over the pixel
+  grid in the current colour, backspace removes the last character, Enter
+  starts a new line below, Escape cancels the whole in-progress label, and
+  clicking elsewhere or switching tools finalizes it. Clicking (or
+  click-dragging) on the canvas
   paints with the current brush; clicking a palette swatch selects that color.
   A second row of common-colour swatches sits at the bottom, ending in a
   rainbow "custom colour" swatch that opens a small hex input (type
@@ -208,6 +218,7 @@ TOOL_HOLLOW_SQUARE = "hollow_square"
 TOOL_LINE = "line"
 TOOL_FILL = "fill"
 TOOL_TEXT = "text"
+TOOL_LABEL = "label"
 
 SHAPE_TOOLS = (
     TOOL_FILLED_RECT,
@@ -227,13 +238,15 @@ _TOOL_LABELS: dict[str, str] = {
     TOOL_LINE: "line",
     TOOL_FILL: "fill",
     TOOL_TEXT: "text",
+    TOOL_LABEL: "label",
 }
 
 # The drawing tools, shown right-aligned on the top (header) row — a distinct
 # region from the centered toolbar. Same (ident, label, icon, action) convention
-# as ``_TOOLBAR_SPEC`` so rendering and hit-testing share one spec. The fill and
-# text tools are click tools, not click-drag shapes, so they are NOT in
-# ``SHAPE_TOOLS`` (that tuple drives the drag -> preview -> commit state machine).
+# as ``_TOOLBAR_SPEC`` so rendering and hit-testing share one spec. The fill,
+# text and label tools are click tools, not click-drag shapes, so they are NOT
+# in ``SHAPE_TOOLS`` (that tuple drives the drag -> preview -> commit state
+# machine).
 _SHAPE_SPEC: list[tuple[str, str, str, str]] = [
     ("filled_rect", "[FR]", "▬", "_tool_filled_rect"),
     ("filled_square", "[FS]", "■", "_tool_filled_square"),
@@ -242,6 +255,7 @@ _SHAPE_SPEC: list[tuple[str, str, str, str]] = [
     ("line", "[Line]", "╱", "_tool_line"),
     ("fill", "[Fill]", "▩", "_tool_fill"),
     ("text", "[Text]", "A", "_tool_text"),
+    ("label", "[Label]", "⌨", "_tool_label"),
 ]
 
 # The keyboard-shortcut help panel in the bottom-left margin of the chrome:
@@ -251,7 +265,7 @@ _SHORTCUT_GROUPS: list[tuple[str, list[str]]] = [
     ("Move", ["←↑↓→"]),
     ("Draw", ["space", "x", "e"]),
     ("Brush", ["+", "−"]),
-    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t"]),
+    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t", "a"]),
     ("Canvas", ["[ ]", "{ }", "Tab"]),
     ("Other", ["c", "1-8", "q"]),
 ]
@@ -533,6 +547,49 @@ def glyph_pixels(char: str, x: int, y: int, scale: int = 1) -> set[tuple[int, in
 
 
 # --------------------------------------------------------------------------- #
+# Label tool: literal terminal text overlaid on the pixel grid (pure helpers)
+# --------------------------------------------------------------------------- #
+
+# Labels are stored as a separate list of annotations ``(row, col, text,
+# color)`` where (row, col) is a terminal cell inside the canvas display area
+# (NOT a canvas pixel). They are never merged into the pixel grid: the canvas
+# draws as usual and the annotations are overlaid on top, character by
+# character, at whole-terminal-cell resolution. Internally the store is a
+# per-cell dict so editing/removing is cell-based; the annotation list is
+# derived from it (and is what gets synced to the server and shown by
+# ``see_canvas``).
+
+
+def label_runs_from_cells(
+    cells: dict[tuple[int, int], tuple[str, Color]],
+) -> list[tuple[int, int, str, Color]]:
+    """Group a per-cell label store into ``(row, col, text, color)`` annotations.
+
+    Each maximal run of consecutive same-colour cells on a row becomes one
+    annotation, so the list is compact and human-readable no matter how the
+    cells were edited.
+    """
+    out: list[tuple[int, int, str, Color]] = []
+    for row in sorted({r for r, _c in cells}):
+        cols = sorted(c for r, c in cells if r == row)
+        run_start = cols[0]
+        run_color = cells[(row, cols[0])][1]
+        run_chars = [cells[(row, cols[0])][0]]
+        prev = cols[0]
+        for col in cols[1:]:
+            char, color = cells[(row, col)]
+            if col == prev + 1 and color == run_color:
+                run_chars.append(char)
+            else:
+                out.append((row, run_start, "".join(run_chars), run_color))
+                run_start, run_color = col, color
+                run_chars = [char]
+            prev = col
+        out.append((row, run_start, "".join(run_chars), run_color))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # The interactive canvas app
 # --------------------------------------------------------------------------- #
 
@@ -590,6 +647,30 @@ class CanvasApp:
         self._text_line_start_x = 0
         self._text_history: list[dict[str, Any]] = []
         self._text_undo: dict[tuple[int, int], Color] = {}
+
+        # Stored terminal-text annotations: a separate list of (row, col, text,
+        # color) tuples in terminal-cell coordinates (NOT canvas pixels), kept in
+        # sync with the server. The per-cell dict is the canonical working store;
+        # the annotation list is derived from it via label_runs_from_cells().
+        self._labels: list[tuple[int, int, str, Color]] = []
+        self._label_cells: dict[tuple[int, int], tuple[str, Color]] = {}
+        # In-progress label entry (terminal cells, not pixels). The session's
+        # typed cells render on top of the stored labels and only become
+        # permanent (merged + synced to the server) when the session is
+        # finalized. Backspace on an empty session may remove an existing
+        # finalized label cell; its pre-removal value is kept in
+        # ``_label_removed`` so Escape restores it.
+        self._label_active = False
+        self._label_row = 0
+        self._label_col = 0
+        self._label_line_start_col = 0
+        self._label_history: list[dict[str, Any]] = []
+        self._label_session_cells: dict[tuple[int, int], tuple[str, Color]] = {}
+        self._label_removed: dict[tuple[int, int], tuple[str, Color]] = {}
+        # The current on-screen overlay (stored + session), diffed against
+        # ``_old_label_chars`` so label edits rewrite only affected cells.
+        self._label_chars: dict[tuple[int, int], tuple[str, Color]] = {}
+        self._old_label_chars: dict[tuple[int, int], tuple[str, Color]] = {}
 
         self._sock: socket.socket | None = None
         self._quit = threading.Event()
@@ -710,6 +791,7 @@ class CanvasApp:
                     row = message["pixels"][y]
                     for x in range(min(self._width, len(row))):
                         self._pixels[y][x] = tuple(row[x])
+                self._apply_labels(message.get("labels", []))
             elif msg_type == "update":
                 if not self._pixels:
                     return
@@ -717,6 +799,8 @@ class CanvasApp:
                     x, y = change["x"], change["y"]
                     if 0 <= x < self._width and 0 <= y < self._height:
                         self._pixels[y][x] = tuple(change["color"])
+            elif msg_type == "labels":
+                self._apply_labels(message.get("labels", []))
             else:
                 return
             self._draw()
@@ -1047,12 +1131,14 @@ class CanvasApp:
         self._old_panel = None
         self._old_cursor_cell = None
         self._cursor_was_reversed = False
+        self._old_label_chars = {}
         self._draw_body()
 
     def _draw_body(self) -> None:
         file = self._console.file
         layout = self._layout()
         rows = self._display_rows()
+        self._label_chars = self._build_label_chars()
 
         header = self._render_top_line()
         if header != self._old_header:
@@ -1085,12 +1171,28 @@ class CanvasApp:
                 file.write(f"\x1b[{layout['top_pad'] + 3 + y};1H\x1b[2K")
                 for x, cell in enumerate(new_row):
                     self._write_cell(file, y, x, cell)
+                    self._overlay_labels(
+                        file, rows, y, {x * CELL_W, x * CELL_W + 1}
+                    )
             else:
                 # Same size as before: rewrite exactly the cells that changed.
                 for x, (cell, prev) in enumerate(zip(new_row, old_row)):
                     if cell != prev:
                         self._write_cell(file, y, x, cell)
+                        self._overlay_labels(
+                            file, rows, y, {x * CELL_W, x * CELL_W + 1}
+                        )
         self._old_cells = rows
+
+        # Label overlay diff: a label edit rewrites only the affected terminal
+        # columns (restore the pixel cell underneath, then re-overlay the label
+        # chars that live there), keeping label changes cheap.
+        old_labels = self._old_label_chars
+        if old_labels != self._label_chars:
+            for pos in set(old_labels) | set(self._label_chars):
+                if old_labels.get(pos) != self._label_chars.get(pos):
+                    self._redraw_label_region(file, rows, pos[0], {pos[1]})
+            self._old_label_chars = self._label_chars
 
         # Cursor overlay: a blinking reverse-video block at the cursor pixel.
         # When it moves, restore the old cell; when the blink phase flips,
@@ -1159,6 +1261,9 @@ class CanvasApp:
         """Draw the cursor cell (reversed while blinking on) plus its brackets."""
         if dy < len(rows) and x < len(rows[dy]):
             self._write_cell(file, dy, x, rows[dy][x], reverse=blink)
+            self._overlay_labels(
+                file, rows, dy, {x * CELL_W, x * CELL_W + 1}, reverse=blink
+            )
         if not blink:
             return  # brackets only show during the "on" blink phase
         layout = self._layout()
@@ -1178,20 +1283,28 @@ class CanvasApp:
         layout = self._layout()
         row = layout["top_pad"] + 3 + dy
         width = len(rows[dy])
+        written: list[int] = []
         if x < width:
             self._write_cell(file, dy, x, rows[dy][x], reverse=False)
+            written.append(x)
         if x - 1 >= 0:
             self._write_cell(file, dy, x - 1, rows[dy][x - 1])
+            written.append(x - 1)
         else:  # the left bracket was in the padding column: clear it
             col = layout["left_pad"] + x * CELL_W
             if 1 <= col <= layout["term_w"]:
                 file.write(f"\x1b[{row};{col}H ")
         if x + 1 < width:
             self._write_cell(file, dy, x + 1, rows[dy][x + 1])
+            written.append(x + 1)
         else:  # the right bracket was in the padding column: clear it
             col = layout["left_pad"] + (x + 1) * CELL_W + 1
             if 1 <= col <= layout["term_w"]:
                 file.write(f"\x1b[{row};{col}H ")
+        # A label char that lives on a restored cell must be re-overlaid so the
+        # cursor blink never clobbers it.
+        for cx in written:
+            self._overlay_labels(file, rows, dy, {cx * CELL_W, cx * CELL_W + 1})
 
     def _redraw_chrome(self) -> None:
         """Redraw only the non-canvas parts: header, cursor, toolbar, palette,
@@ -1202,6 +1315,7 @@ class CanvasApp:
             file = self._console.file
             layout = self._layout()
             rows = self._display_rows()
+            self._label_chars = self._build_label_chars()
 
             header = self._render_top_line()
             if header != self._old_header:
@@ -1267,6 +1381,86 @@ class CanvasApp:
             file.write("\x1b[7m")  # reverse video marks the cursor cell
         file.write(CELL_CH)
         file.write(RESET)
+
+    def _label_cell(self, col: int, row: int) -> tuple[int, int] | None:
+        """Map a terminal (1-based) col/row to a label terminal cell, or None.
+
+        Labels are positioned at whole-terminal-cell resolution, so this does
+        NOT floor to display-cell granularity like ``_screen_cell``: the tcol is
+        the exact terminal column (0-based within the canvas area).
+        """
+        layout = self._compute_layout()
+        # Display row 0 lives at terminal row top_pad + 3 (header + toolbar).
+        trow = row - 1 - (layout["top_pad"] + 2)  # 0-based canvas display row
+        tcol = col - 1 - layout["left_pad"]  # 0-based terminal column
+        if trow < 0 or trow >= layout["canvas_rows"]:
+            return None  # above or below the canvas area
+        if tcol < 0 or tcol >= self._width * CELL_W:
+            return None
+        if layout["left_pad"] + (tcol // CELL_W + 1) * CELL_W > layout["term_w"]:
+            return None  # this display cell is clipped off the right edge
+        return trow, tcol
+
+    def _overlay_labels(
+        self,
+        file: Any,
+        rows: list[list[Cell]],
+        trow: int,
+        tcols: set[int],
+        reverse: bool = False,
+    ) -> None:
+        """Overlay the label chars at ``tcols`` of display row ``trow``.
+
+        Each label char renders in the label colour on the pixel cell's bottom
+        colour (so it blends into the pixel grid it covers) using the terminal's
+        own font — crisp at any size. ``reverse`` (the cursor) swaps fg/bg so a
+        label char under the cursor blinks like the block around it.
+        """
+        if trow >= len(rows):
+            return  # below the visible canvas area
+        layout = self._layout()
+        term_row = layout["top_pad"] + 3 + trow
+        for tcol in sorted(tcols):
+            entry = self._label_chars.get((trow, tcol))
+            if entry is None:
+                continue
+            char, color = entry
+            term_col = layout["left_pad"] + tcol + 1
+            if term_row > layout["term_h"] or term_col > layout["term_w"]:
+                continue  # off-screen: skip (the pixel cell was already written)
+            cell_x = tcol // CELL_W
+            if cell_x < len(rows[trow]):
+                br, bg, bb = rows[trow][cell_x][1]  # the cell's bottom pixel
+            else:
+                br, bg, bb = self._background
+            file.write(f"\x1b[{term_row};{term_col}H")
+            file.write(f"\x1b[38;2;{color[0]};{color[1]};{color[2]}m")
+            file.write(f"\x1b[48;2;{br};{bg};{bb}m")
+            if reverse:
+                file.write("\x1b[7m")
+            file.write(char)
+            file.write(RESET)
+
+    def _redraw_label_region(
+        self, file: Any, rows: list[list[Cell]], trow: int, tcols: set[int]
+    ) -> None:
+        """Restore the pixel cells under ``tcols`` and re-overlay their labels.
+
+        The primitive for add/edit/remove of a label char: rewriting the display
+        cells (both terminal columns each) brings back the pixel-block content,
+        then the overlay re-applies whatever label chars live there — including
+        the odd-terminal-column case where a char covers only one of a display
+        cell's two columns.
+        """
+        cell_xs = {tcol // CELL_W for tcol in tcols}
+        if trow < len(rows):
+            for cell_x in cell_xs:
+                if cell_x < len(rows[trow]):
+                    self._write_cell(file, trow, cell_x, rows[trow][cell_x])
+        overlay_cols = {
+            c for cell_x in cell_xs for c in (cell_x * CELL_W, cell_x * CELL_W + 1)
+        }
+        self._overlay_labels(file, rows, trow, overlay_cols)
 
     # -- input handling ---------------------------------------------------------
 
@@ -1407,7 +1601,10 @@ class CanvasApp:
         return self._paint_at_cursor()
 
     def _set_tool(self, tool: str) -> list[dict[str, Any]]:
-        self._text_finalize()  # switching tools commits any in-progress text
+        # Switching tools commits any in-progress text entry and any in-progress
+        # label entry (finalize is visual-no-change, so a chrome redraw is safe).
+        self._text_finalize()
+        self._label_finalize()
         self._tool = tool
         self._pending_chrome = True
         return []
@@ -1415,6 +1612,8 @@ class CanvasApp:
     def _tool_eraser(self) -> list[dict[str, Any]]:
         # 'e' toggles between eraser and paint (like before); picking a shape
         # tool is a separate, one-way selection.
+        self._text_finalize()
+        self._label_finalize()
         self._tool = TOOL_ERASER if self._tool != TOOL_ERASER else TOOL_PAINT
         self._pending_chrome = True
         return []
@@ -1439,6 +1638,9 @@ class CanvasApp:
 
     def _tool_text(self) -> list[dict[str, Any]]:
         return self._set_tool(TOOL_TEXT)
+
+    def _tool_label(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_LABEL)
 
     # -- shape drag state machine ---------------------------------------------
 
@@ -1651,6 +1853,195 @@ class CanvasApp:
         self._cursor_x = min(self._text_x, max(0, self._width - 1))
         self._cursor_y = min(self._text_y, max(0, self._height - 1))
 
+    # -- label tool state machine -------------------------------------------
+    #
+    # The label tool is the literal-text counterpart to the pixel-art text tool.
+    # Selecting it and clicking the canvas starts a label session at that
+    # terminal cell. Each character typed is stored in ``_label_session_cells``
+    # (terminal-cell coordinates, NOT pixels) and rendered immediately on top of
+    # the pixel grid in the terminal's own font; backspace removes the last
+    # character, Enter starts a new line below, and Escape cancels the whole
+    # in-progress label. Clicking elsewhere or switching tools finalizes it —
+    # the session cells merge into the stored ``_label_cells`` and are synced to
+    # the server as (row, col, text, color) annotations, which see_canvas shows.
+    # Labels never touch the pixel grid: they are an overlay.
+
+    def _label_place(self, row: int, col: int) -> list[dict[str, Any]]:
+        """Start a label session at terminal cell (row, col); finalize any prior
+        text/label session. Returns [] without setting ``_pending_chrome`` —
+        label typing produces overlay-only changes, so ``_after_edit`` must do a
+        full ``_draw()``, not just a chrome redraw."""
+        self._text_finalize()
+        self._label_finalize()
+        self._label_active = True
+        self._label_row = row
+        self._label_col = col
+        self._label_line_start_col = col
+        self._label_history = []
+        self._label_session_cells = {}
+        self._label_removed = {}
+        self._sync_label_caret()
+        return []
+
+    def _label_type_char(self, ch: str) -> list[dict[str, Any]]:
+        """Route one keystroke while a label session is active."""
+        if ch in ("\r", "\n"):
+            return self._label_newline()
+        if ch in ("\x7f", "\x08"):  # backspace
+            return self._label_backspace()
+        if ch == "\t":
+            return []  # tab does nothing mid-label
+        if ch == " ":
+            return self._label_type(" ")
+        return self._label_type(ch)
+
+    def _label_type(self, ch: str) -> list[dict[str, Any]]:
+        """Write one literal terminal character at the insertion point and
+        advance right. Stops at the right edge of the canvas display area."""
+        if self._label_col >= self._width * CELL_W:
+            return []  # right edge: stop accepting characters
+        pos = (self._label_row, self._label_col)
+        self._label_session_cells[pos] = (ch, self._color)
+        self._label_history.append(
+            {"kind": "char", "row": self._label_row, "col": self._label_col,
+             "char": ch, "color": self._color}
+        )
+        self._label_col += 1
+        self._sync_label_caret()
+        return []
+
+    def _label_newline(self) -> list[dict[str, Any]]:
+        """Move the insertion point to the start of the next line below."""
+        layout = self._compute_layout()
+        if self._label_row + 1 >= layout["canvas_rows"]:
+            return []  # bottom edge: ignore Enter
+        self._label_history.append(
+            {"kind": "newline", "row": self._label_row, "col": self._label_col}
+        )
+        self._label_row += 1
+        self._label_col = self._label_line_start_col
+        self._sync_label_caret()
+        return []
+
+    def _label_backspace(self) -> list[dict[str, Any]]:
+        """Erase the last character (or undo a newline) and step back. With an
+        empty session, removes an existing finalized label cell left of (or
+        under) the cursor so backspace can delete finished text too. The
+        removal stays local (in ``_label_removed``) until the session ends, so
+        Escape can restore it and no server echo cancels the session mid-entry."""
+        if not self._label_history:
+            self._erase_existing_label_cell()
+            return []
+        entry = self._label_history.pop()
+        if entry["kind"] == "newline":
+            self._label_row, self._label_col = entry["row"], entry["col"]
+        else:
+            self._label_session_cells.pop(
+                (entry["row"], entry["col"]), None
+            )
+            self._label_row, self._label_col = entry["row"], entry["col"]
+        self._sync_label_caret()
+        return []
+
+    def _erase_existing_label_cell(self) -> bool:
+        """Pop one finalized label cell left of (or under) the cursor, keeping
+        it in ``_label_removed`` so Escape restores it. Returns True if removed."""
+        candidates = [(self._label_row, self._label_col - 1),
+                      (self._label_row, self._label_col)]
+        for candidate in candidates:
+            if candidate in self._label_cells:
+                self._label_removed[candidate] = self._label_cells.pop(candidate)
+                return True
+        return False
+
+    def _label_cancel(self) -> list[dict[str, Any]]:
+        """Escape: discard the in-progress session. Any finalized cell removed
+        by backspace is restored first, so the stored labels are unchanged."""
+        if not self._label_active:
+            return []
+        if self._label_removed:
+            self._label_cells.update(self._label_removed)
+        self._label_active = False
+        self._label_session_cells = {}
+        self._label_removed = {}
+        self._label_history = []
+        self._sync_labels()
+        self._pending_chrome = False  # force _after_edit to redraw the canvas
+        return []
+
+    def _label_finalize(self) -> None:
+        """Commit any in-progress label: session cells merge into the stored
+        store and are synced to the server. Visual-no-change, so no redraw."""
+        if self._label_active and self._label_session_cells:
+            self._label_cells.update(self._label_session_cells)
+        self._label_active = False
+        self._label_session_cells = {}
+        self._label_removed = {}
+        self._label_history = []
+        self._sync_labels()
+
+    def _sync_label_caret(self) -> None:
+        """Move the canvas cursor to the label insertion point (clamped to the
+        display cell containing the insertion column)."""
+        self._cursor_x = min(self._label_col // CELL_W, max(0, self._width - 1))
+        self._cursor_y = min(self._label_row * 2, max(0, self._height - 1))
+
+    def _build_label_chars(self) -> dict[tuple[int, int], tuple[str, Color]]:
+        """The current overlay: stored labels plus any in-progress session."""
+        out = dict(self._label_cells)
+        out.update(self._label_session_cells)
+        return out
+
+    def _sync_labels(self) -> None:
+        """Re-derive the annotation list from the cell store and push it to the
+        server if it changed."""
+        new_labels = label_runs_from_cells(self._label_cells)
+        if new_labels != self._labels:
+            self._labels = new_labels
+            self._send_labels()
+
+    def _send_labels(self) -> None:
+        """Broadcast the full annotation list to the server."""
+        if self._sock is None:
+            return
+        payload = json.dumps({
+            "type": "labels",
+            "labels": [
+                [row, col, text, list(color)]
+                for row, col, text, color in self._labels
+            ],
+        }) + "\n"
+        try:
+            self._sock.sendall(payload.encode())
+        except OSError:
+            pass
+
+    def _apply_labels(self, labels: list[Any]) -> None:
+        """Replace stored annotations from a server ``labels`` message. Any
+        in-progress label session is cancelled (its cells were not synced)."""
+        self._label_active = False
+        self._label_session_cells = {}
+        self._label_removed = {}
+        self._label_history = []
+        cells: dict[tuple[int, int], tuple[str, Color]] = {}
+        for entry in labels:
+            if not (isinstance(entry, list) and len(entry) == 4):
+                continue
+            row, col, text, color = entry
+            if not (isinstance(row, int) and isinstance(col, int)
+                    and isinstance(text, str)):
+                continue
+            try:
+                rgb = tuple(int(c) for c in color)
+            except (TypeError, ValueError):
+                continue
+            if len(rgb) != 3:
+                continue
+            for i, char in enumerate(text):
+                cells[(row, col + i)] = (char, Color(rgb))
+        self._label_cells = cells
+        self._labels = label_runs_from_cells(cells)
+
     def _tool_brush_dec(self) -> list[dict[str, Any]]:
         return self._set_size(self._current_size() - 1)
 
@@ -1736,6 +2127,20 @@ class CanvasApp:
             if button == 0:
                 return self._text_place(cell_col, display_row * 2)
             return []  # drag/wheel with the text tool: nothing to do
+        # A canvas click with the label tool places the label caret at
+        # whole-terminal-cell resolution (not display-cell granularity). A
+        # click on a cell that is clipped off the right edge of the window
+        # paints nothing.
+        label_hit = self._label_cell(col, row)
+        if self._tool == TOOL_LABEL and label_hit is not None:
+            if button == 0:
+                return self._label_place(*label_hit)
+            return []  # drag/wheel with the label tool: nothing to do
+        if self._tool == TOOL_LABEL:
+            # On the canvas but clipped (or below it): the label tool paints
+            # nothing; don't fall through to the paint path.
+            if self._screen_cell(col, row) is not None:
+                return []
         # The brush slider is a live size control: with the text tool active it
         # sets the text scale without finalizing the in-progress text, so a
         # mid-session scale change only affects characters typed after it.
@@ -1747,8 +2152,9 @@ class CanvasApp:
                     self._palette_mode = False
                     self._pending_chrome = True
                 return self._set_size(slider.brush_size_for(col))
-        # Every other press finalizes any in-progress text entry.
+        # Every other press finalizes any in-progress text or label entry.
         self._text_finalize()
+        self._label_finalize()
         shape = self._shape_toolbar_geometry()
         if row == shape["row"]:
             for b in shape["buttons"]:
@@ -1848,6 +2254,10 @@ class CanvasApp:
             if ch in "-_":
                 return self._set_size(self._current_size() - 1)
             return self._text_type_char(ch)  # an active text entry swallows keys
+        if self._label_active:
+            # An active label swallows every key (including +/-) as a literal
+            # character — the label renders real terminal text, not brush art.
+            return self._label_type_char(ch)
         if ch == "q":
             self._quit.set()
             return []
@@ -1888,6 +2298,8 @@ class CanvasApp:
             return self._set_tool(TOOL_FILL)
         if ch == "t":
             return self._set_tool(TOOL_TEXT)
+        if ch == "a":
+            return self._set_tool(TOOL_LABEL)
         if ch in "+=":
             return self._set_size(self._current_size() + 1)
         if ch in "-_":
@@ -1915,6 +2327,8 @@ class CanvasApp:
                 return []  # arrows do nothing mid hex input
             if self._text_active:
                 return []  # the text caret is driven by typing, not arrows
+            if self._label_active:
+                return []  # the label caret is driven by typing, not arrows
             dx, dy = {"A": (0, -1), "B": (0, 1), "C": (1, 0), "D": (-1, 0)}[final]
             if self._palette_mode:
                 self._select_color(self._palette_idx + dx + dy * 4)
@@ -1953,6 +2367,8 @@ class CanvasApp:
                 self._cancel_shape_drag()  # a stray Esc cancels an in-progress shape
             if self._text_active:
                 return self._text_cancel()  # a stray Esc reverts the text session
+            if self._label_active:
+                return self._label_cancel()  # a stray Esc cancels the label session
             return []  # Alt+key or a stray ESC: ignore
         buf = ""
         while True:

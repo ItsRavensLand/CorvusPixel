@@ -36,8 +36,10 @@ from canvas_app import (
     TOOL_HOLLOW_RECT,
     TOOL_HOLLOW_SQUARE,
     TOOL_LINE,
+    TOOL_LABEL,
     TOOL_PAINT,
     TOOL_TEXT,
+    label_runs_from_cells,
     _FONT5X7,
     CanvasApp,
     ToolButton,
@@ -1260,7 +1262,7 @@ def test_shape_toolbar_right_aligned_and_selects():
     assert shape["row"] == app._layout_info["top_pad"] + 1  # the header row
     assert [b.ident for b in shape["buttons"]] == [
         "filled_rect", "filled_square", "hollow_rect", "hollow_square", "line",
-        "fill", "text",
+        "fill", "text", "label",
     ]
     last = shape["buttons"][-1]
     assert last.col + last.width - 1 <= 80  # right-aligned, fits the terminal
@@ -1317,11 +1319,12 @@ def wide_app() -> CanvasApp:
 def test_shortcuts_panel_full_grouping_on_wide_terminal():
     app = wide_app()
     # The quick-colour row leaves a 57-column left margin: all six groups fit,
-    # packed into lines with a short labelled header per group.
+    # packed into lines with a short labelled header per group. "a" joined the
+    # Shapes group, so Other now spills onto its own (third) line.
     assert app._shortcuts_panel(avail=57) == [
         [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−")],
-        [("Shapes", "p·r·o·f·s·l·b·t"), ("Canvas", "[ ]·{ }·Tab"),
-         ("Other", "c·1-8·q")],
+        [("Shapes", "p·r·o·f·s·l·b·t·a"), ("Canvas", "[ ]·{ }·Tab")],
+        [("Other", "c·1-8·q")],
     ]
 
 
@@ -2004,3 +2007,239 @@ def test_slider_handle_renders_at_text_scale():
     idx = rendered.index(marker) + len(marker)
     expected = "─" * 2 + f"\x1b[7m●{RESET}" + "─" * (BRUSH_MAX - 3)
     assert rendered[idx:idx + len(expected)] == expected
+
+
+# --------------------------------------------------------------------------- #
+# Label tool: literal terminal text overlaid on the pixel grid
+# --------------------------------------------------------------------------- #
+
+
+def label_screen(app: CanvasApp, trow: int, tcol: int) -> tuple[int, int]:
+    """Terminal (1-based col, row) of a label terminal cell (trow, tcol)."""
+    l = app._layout_info
+    return (l["left_pad"] + tcol + 1, l["top_pad"] + 3 + trow)
+
+
+def test_label_runs_from_cells_groups_runs():
+    """Consecutive same-colour cells on a row merge; others split the run."""
+    cells = {
+        (0, 0): ("H", (255, 0, 0)),
+        (0, 1): ("i", (255, 0, 0)),
+        (0, 2): ("!", (0, 0, 255)),  # colour change splits the run
+        (2, 5): ("x", (255, 0, 0)),  # a lone cell on its own row
+    }
+    assert label_runs_from_cells(cells) == [
+        (0, 0, "Hi", (255, 0, 0)),
+        (0, 2, "!", (0, 0, 255)),
+        (2, 5, "x", (255, 0, 0)),
+    ]
+
+
+def test_label_cell_maps_click_to_terminal_coords():
+    """The label tool resolves whole terminal columns, unlike the paint tools."""
+    app = text_app()
+    col, row = cell_screen(app, 0, 0)  # top-left of the canvas display area
+    assert app._label_cell(col, row) == (0, 0)
+    assert app._label_cell(col + 1, row) == (0, 1)  # right half of the display cell
+    assert app._label_cell(5, row) is None  # in the left padding: not the canvas
+    assert app._label_cell(col, 2) is None  # the header row: above the canvas
+
+
+def test_label_hotkey_and_button_select():
+    app = make_app()
+    assert app._handle_char("a") == []
+    assert app._tool == TOOL_LABEL
+    shape = app._shape_toolbar_geometry()
+    b = next(bt for bt in shape["buttons"] if bt.ident == "label")
+    assert app._handle_csi(f"<0;{b.col};{b.row}", "M") == []
+    assert app._tool == TOOL_LABEL
+
+
+def test_label_click_starts_session():
+    app = text_app()
+    app._tool = TOOL_LABEL
+    col, row = label_screen(app, 2, 3)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._label_active is True
+    assert (app._label_row, app._label_col) == (2, 3)
+    assert (app._cursor_x, app._cursor_y) == (3 // CELL_W, 2 * 2)
+
+
+def test_label_typing_advances_terminal_columns():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(1, 0)
+    assert app._handle_char("H") == []
+    assert app._label_session_cells == {(1, 0): ("H", (255, 0, 0))}
+    assert (app._label_row, app._label_col) == (1, 1)
+    assert app._handle_char("i") == []
+    assert app._label_session_cells[(1, 1)] == ("i", (255, 0, 0))
+    assert (app._label_row, app._label_col) == (1, 2)
+
+
+def test_label_backspace_removes_last_char():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 0)
+    app._handle_char("H")
+    app._handle_char("i")
+    assert app._handle_char("\x7f") == []
+    assert app._label_session_cells == {(0, 0): ("H", (255, 0, 0))}
+    assert (app._label_row, app._label_col) == (0, 1)
+    app._handle_char("\x7f")
+    assert app._label_session_cells == {}
+    assert (app._label_row, app._label_col) == (0, 0)
+
+
+def test_label_backspace_empty_session_removes_existing_label():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 1)
+    app._handle_char("H")  # finalized label char at (0,1)
+    app._label_finalize()
+    assert (0, 1) in app._label_cells
+    app._label_place(0, 2)  # a fresh session right after the char
+    assert app._handle_char("\x7f") == []
+    assert (0, 1) not in app._label_cells  # the stored char is removed
+    assert (0, 1) in app._label_removed  # and kept so Escape can restore it
+
+
+def test_label_enter_new_line():
+    app = text_app()
+    app._label_place(1, 4)
+    assert app._handle_char("\r") == []
+    assert (app._label_row, app._label_col) == (2, 4)  # back to the line start col
+
+
+def test_label_escape_cancels_session():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 0)
+    app._handle_char("H")
+    app._handle_char("i")
+    assert app._label_active is True
+    app._read_escape_sequence()  # a stray ESC (no CSI) cancels the session
+    assert app._label_active is False
+    assert app._label_session_cells == {}
+    assert app._label_cells == {}  # nothing committed
+
+
+def test_label_escape_restores_removed_existing():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 1)
+    app._handle_char("H")
+    app._label_finalize()
+    app._label_place(0, 2)
+    app._handle_char("\x7f")  # removes the stored (0,1) "H"
+    assert (0, 1) not in app._label_cells
+    app._read_escape_sequence()  # a stray ESC cancels + restores the removed char
+    assert app._label_active is False
+    assert app._label_cells[(0, 1)] == ("H", (255, 0, 0))
+
+
+def test_label_finalize_commits():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 0)
+    app._handle_char("H")
+    app._handle_char("i")
+    app._label_finalize()
+    assert app._label_active is False
+    assert app._label_cells[(0, 0)] == ("H", (255, 0, 0))
+    assert app._label_cells[(0, 1)] == ("i", (255, 0, 0))
+    assert app._labels == [(0, 0, "Hi", (255, 0, 0))]
+
+
+def test_label_right_edge_stops():
+    app = text_app(width=4)  # 4 pixels * CELL_W = 8 terminal columns
+    app._color = (255, 0, 0)
+    app._label_place(0, 7)  # the last terminal column
+    assert app._handle_char("H") == []
+    assert (app._label_row, app._label_col) == (0, 8)
+    assert app._handle_char("i") == []  # past the right edge: ignored
+    assert (app._label_row, app._label_col) == (0, 8)
+
+
+def test_label_bottom_edge_stops_enter():
+    app = text_app(height=4)  # canvas_rows = 2, so trow 1 is the last display row
+    app._label_place(1, 0)
+    assert app._handle_char("\r") == []  # no room for another line
+    assert (app._label_row, app._label_col) == (1, 0)
+
+
+def test_label_tool_switch_finalizes():
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 0)
+    app._handle_char("H")
+    app._handle_char("p")  # while a label is active 'p' is a literal char
+    assert app._label_session_cells.get((0, 1)) == ("p", (255, 0, 0))
+    assert app._label_active is True  # still typing, the tool did NOT switch
+    b = app._shape_toolbar_geometry()["buttons"][0]  # the filled-rect button
+    app._handle_csi(f"<0;{b.col};{b.row}", "M")  # switch tool via the mouse
+    assert app._tool == TOOL_FILLED_RECT
+    assert app._label_active is False  # finalized: merged into the stored store
+    assert app._label_cells[(0, 0)] == ("H", (255, 0, 0))
+    assert app._label_cells[(0, 1)] == ("p", (255, 0, 0))
+
+
+def test_label_char_overwrites_pixel_block():
+    """A label char renders over the pixel block it covers, in the label color."""
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._paint_pixel(0, 0, (255, 0, 0))  # red pixel under terminal cell (0,0)
+    app._draw()
+    baseline = app._console.file.getvalue()
+    l = app._layout_info
+    pos = f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H"
+    assert pos in baseline  # the pixel cell is drawn first
+    assert "\x1b[38;2;255;0;0m" in baseline
+    # now place a blue "X" label exactly over it
+    app._color = (0, 0, 255)
+    app._label_place(0, 0)
+    app._handle_char("X")
+    app._draw()
+    delta = app._console.file.getvalue()[len(baseline):]
+    assert pos in delta  # the cell is rewritten (restore-then-overlay)
+    assert "\x1b[38;2;0;0;255m" in delta  # the label color
+    assert "X" in delta  # the literal character
+
+
+def test_label_removal_restores_pixel_cell():
+    """Removing a label char restores the pixel-block content underneath."""
+    app = make_app()
+    app._color = (255, 0, 0)
+    app._paint_pixel(0, 0, (255, 0, 0))
+    app._color = (0, 0, 255)
+    app._label_place(0, 0)
+    app._handle_char("X")
+    app._label_finalize()
+    app._draw()
+    baseline = app._console.file.getvalue()
+    l = app._layout_info
+    pos = f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H"
+    assert "X" in baseline
+    # a fresh session right after the char, then backspace removes it
+    app._label_place(0, 1)
+    app._handle_char("\x7f")
+    app._draw()
+    delta = app._console.file.getvalue()[len(baseline):]
+    assert pos in delta  # the pixel cell is rewritten
+    assert "\x1b[38;2;255;0;0m" in delta  # the red pixel block is back
+    assert "X" not in delta  # the label char is gone
+
+
+def test_app_apply_labels_message_replaces_annotations():
+    """A server labels broadcast replaces the whole store (another window)."""
+    app = text_app()
+    app._color = (255, 0, 0)
+    app._label_place(0, 0)
+    app._handle_char("H")
+    app._label_finalize()
+    assert app._labels == [(0, 0, "H", (255, 0, 0))]
+    app._apply({"type": "labels", "labels": [[0, 2, "AB", [0, 0, 255]]]})
+    assert app._labels == [(0, 2, "AB", (0, 0, 255))]
+    assert app._label_cells[(0, 2)] == ("A", (0, 0, 255))
+    assert app._label_cells[(0, 3)] == ("B", (0, 0, 255))
+    assert (0, 0) not in app._label_cells
