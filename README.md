@@ -52,9 +52,12 @@ session it just says "Canvas already open in this session."
   top-right corner: with **fill**, one click flood-fills the whole 4-connected
   same-color region under the cursor with the current color; with **text**, a
   click places the insertion point and typing draws 5×7 bitmap characters in the
-  current color — Backspace erases the last character, Enter moves to a new
-  line below, and Escape cancels the whole in-progress session (click elsewhere
-  or switch tools to finalize it).
+  current color — the brush-size bar doubles as the **text-size control** while
+  this tool is active (each font pixel draws as an N×N block, so a larger scale
+  makes chunkier, more readable text; changing it mid-typing only affects
+  characters typed after the change) — Backspace erases the last character,
+  Enter moves to a new line below, and Escape cancels the whole in-progress
+  session (click elsewhere or switch tools to finalize it).
 - **Keyboard**
   - A live reminder of all these shortcuts sits in the bottom-left corner of the
     window, packed into small labelled groups (move / draw / brush / shapes /
@@ -72,9 +75,12 @@ session it just says "Canvas already open in this session."
     thickness follow the brush size) · `p` — back to the paint tool
   - `b` — bucket fill: one click flood-fills the connected same-color region ·
     `t` — text tool: click to place the insertion point, type to draw,
-    Backspace erases, Enter moves to a new line, Escape cancels the session
+    Backspace erases, Enter moves to a new line, Escape cancels the session;
+    while this tool is active the brush bar / `+` `-` set the text scale
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
-    the toolbar's brush bar does the same with the mouse)
+    the toolbar's brush bar does the same with the mouse). With the **text tool
+    active** they set the text scale instead (each font pixel draws as an N×N
+    block; the brush bar doubles as the same control)
   - `[`/`]` — shrink/grow the canvas width (right edge) ·
     `{`/`}` — shrink/grow the height (bottom edge)
   - `c` — cycle the palette · `1`–`8` — pick a palette color directly

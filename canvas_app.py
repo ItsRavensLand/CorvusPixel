@@ -12,7 +12,8 @@ draw:
   tool (a click flood-fills the connected same-colour region); ``t`` selects
   the text tool (a click places a text caret, typing draws in a small bitmap
   font, backspace erases, Enter starts a new line, Escape reverts the whole
-  session); ``+``/``-`` grow/shrink the square brush; ``[``/``]`` and
+  session, and the brush-size bar / ``+``/``-`` keys set the text scale while
+  the tool is active); ``+``/``-`` grow/shrink the square brush; ``[``/``]`` and
   ``{``/``}`` grow/shrink the canvas (columns at the right edge, rows at the
   bottom edge); ``c`` cycles the palette; ``1``-``8`` pick a palette color;
   ``Tab`` opens the visual palette (arrow keys + Enter/space select); ``q`` or
@@ -25,9 +26,11 @@ draw:
   Shape tools then click-drag on the canvas — a dimmed preview follows the
   cursor and is committed on release (Escape cancels). The bucket fill paints
   the connected same-colour region in one click. The text tool places a caret
-  where you click; typing draws each character in the current colour, backspace
-  erases the last character, Enter starts a new line below, and Escape reverts
-  everything typed in this session. Clicking (or click-dragging) on the canvas
+  where you click; typing draws each character in the current colour (the
+  brush-size bar doubles as the text-scale control while this tool is active),
+  backspace erases the last character, Enter starts a new line below, and
+  Escape reverts everything typed in this session. Clicking (or click-dragging)
+  on the canvas
   paints with the current brush; clicking a palette swatch selects that color.
   A second row of common-colour swatches sits at the bottom, ending in a
   rainbow "custom colour" swatch that opens a small hex input (type
@@ -509,16 +512,23 @@ _FONT5X7: dict[str, tuple[str, ...]] = {
 }
 
 
-def glyph_pixels(char: str, x: int, y: int) -> set[tuple[int, int]]:
-    """The lit pixels of ``char`` drawn with its top-left corner at (x, y)."""
+def glyph_pixels(char: str, x: int, y: int, scale: int = 1) -> set[tuple[int, int]]:
+    """The lit pixels of ``char`` drawn with its top-left corner at (x, y).
+
+    ``scale`` replicates each lit font pixel as an N x N block of canvas pixels
+    (nearest-neighbour pixel-art upscaling); scale 1 is the native 5x7 glyph.
+    A scale below 1 renders nothing.
+    """
     pattern = _FONT5X7.get(char)
-    if pattern is None:
+    if pattern is None or scale < 1:
         return set()
     return {
-        (x + px, y + py)
-        for py, row in enumerate(pattern)
-        for px, cell in enumerate(row)
+        (x + fx * scale + i, y + fy * scale + j)
+        for fy, row in enumerate(pattern)
+        for fx, cell in enumerate(row)
         if cell == "#"
+        for i in range(scale)
+        for j in range(scale)
     }
 
 
@@ -561,6 +571,7 @@ class CanvasApp:
         self._hex_buffer = ""
         self._tool = TOOL_PAINT
         self._brush_size = 1
+        self._text_scale = 1  # text renders each font pixel as an NxN block
         self._pending_resize: tuple[int, int] | None = None
 
         # In-progress shape drag: start/end canvas cells and the local (never
@@ -782,11 +793,16 @@ class CanvasApp:
         and the whole row is diffed as one unit in ``_draw_body``/``_redraw_chrome``.
         """
         tool = _TOOL_LABELS[self._tool]
+        size_label = (
+            f"text size {self._text_scale}"
+            if self._tool == TOOL_TEXT
+            else f"brush {self._brush_size}"
+        )
         text = (
             f"CorvusPixel  {self._width}x{self._height}  "
             f"{'● connected' if self._connected else '○ reconnecting…'}   "
             f"cursor ({self._cursor_x},{self._cursor_y})   "
-            f"brush {self._brush_size} · {tool}   {hex_str(self._color)}"
+            f"{size_label} · {tool}   {hex_str(self._color)}"
         )
         if self._palette_mode:
             text += "   palette: arrows move · enter select"
@@ -995,8 +1011,9 @@ class CanvasApp:
         slider = geom["slider"]
         if slider is not None:
             handle = f"\x1b[7m●{RESET}"
-            dashes_before = "─" * (self._brush_size - 1)
-            dashes_after = "─" * (BRUSH_MAX - self._brush_size)
+            size = self._current_size()  # brush size, or text scale with text active
+            dashes_before = "─" * (size - 1)
+            dashes_after = "─" * (BRUSH_MAX - size)
             avail = term_w - slider.col + 1
             if avail >= BRUSH_MAX:  # everything fits: normal render
                 track = dashes_before + handle + dashes_after
@@ -1366,6 +1383,26 @@ class CanvasApp:
         self._pending_chrome = True
         return []
 
+    def _set_text_scale(self, size: int) -> list[dict[str, Any]]:
+        """Clamp and apply the text scale (how big each font pixel renders)."""
+        new = max(BRUSH_MIN, min(BRUSH_MAX, size))
+        if new == self._text_scale:
+            return []
+        self._text_scale = new
+        self._pending_chrome = True
+        return []
+
+    def _current_size(self) -> int:
+        """The value the brush slider shows: the text scale while the text tool
+        is active, the brush size otherwise. The slider is context-sensitive."""
+        return self._text_scale if self._tool == TOOL_TEXT else self._brush_size
+
+    def _set_size(self, size: int) -> list[dict[str, Any]]:
+        """Route a slider / +/- change to the size the active tool uses."""
+        if self._tool == TOOL_TEXT:
+            return self._set_text_scale(size)
+        return self._set_brush_size(size)
+
     def _tool_paint(self) -> list[dict[str, Any]]:
         return self._paint_at_cursor()
 
@@ -1475,7 +1512,10 @@ class CanvasApp:
     # server like any other edit), backspace erases the last character, Enter
     # starts a new line below, and Escape reverts EVERYTHING drawn during the
     # session (tracked in ``_text_undo``). Clicking elsewhere or switching tools
-    # finalizes the text — nothing more can be reverted after that.
+    # finalizes the text — nothing more can be reverted after that. The brush
+    # slider and ``+``/``-`` keys set the text scale while the text tool is
+    # active; each glyph is drawn at the scale in effect when it is typed, so a
+    # mid-session scale change only affects characters typed after it.
 
     def _text_place(self, x: int, y: int) -> list[dict[str, Any]]:
         """Start a text session at (x, y); a previous session is finalized."""
@@ -1506,18 +1546,25 @@ class CanvasApp:
         return self._text_draw_glyph(ch)
 
     def _text_draw_glyph(self, ch: str) -> list[dict[str, Any]]:
-        """Draw one glyph at the insertion point and advance right.
+        """Draw one glyph at the insertion point (scaled) and advance right.
 
-        If the glyph's 5x7 box would not fit on the canvas the character is
-        simply not accepted (the user can press Enter to drop a line). The
-        pre-edit colour of every pixel we actually change is remembered in
-        ``_text_undo`` so Escape can revert the whole session.
+        Each font pixel renders as an ``_text_scale`` x ``_text_scale`` block,
+        so a glyph box is ``FONT_W * scale`` wide and ``FONT_H * scale`` tall.
+        If that box would not fit on the canvas the character is simply not
+        accepted (the user can press Enter to drop a line). The scale is read
+        at draw time, so changing it mid-session only affects characters typed
+        after the change. The pre-edit colour of every pixel we actually change
+        is remembered in ``_text_undo`` so Escape can revert the whole session.
         """
-        if self._text_x + FONT_W > self._width or self._text_y + FONT_H > self._height:
+        scale = self._text_scale
+        if (
+            self._text_x + FONT_W * scale > self._width
+            or self._text_y + FONT_H * scale > self._height
+        ):
             return []  # out of bounds: stop accepting characters
         changes: list[dict[str, Any]] = []
         glyph_pixels_drawn: list[tuple[int, int]] = []
-        for px, py in glyph_pixels(ch, self._text_x, self._text_y):
+        for px, py in glyph_pixels(ch, self._text_x, self._text_y, scale):
             old = self._pixels[py][px]
             if old == self._color:
                 continue  # already this colour: nothing to draw or undo
@@ -1530,7 +1577,7 @@ class CanvasApp:
             {"kind": "glyph", "x": self._text_x, "y": self._text_y,
              "pixels": glyph_pixels_drawn}
         )
-        self._text_x += FONT_W + FONT_SPACING
+        self._text_x += (FONT_W + FONT_SPACING) * scale
         self._sync_text_caret()
         return changes
 
@@ -1539,14 +1586,19 @@ class CanvasApp:
         self._text_history.append(
             {"kind": "glyph", "x": self._text_x, "y": self._text_y, "pixels": []}
         )
-        self._text_x += FONT_W + FONT_SPACING
+        self._text_x += (FONT_W + FONT_SPACING) * self._text_scale
         self._sync_text_caret()
         return []
 
     def _text_newline(self) -> list[dict[str, Any]]:
-        """Commit the current line and move the insertion point below it."""
-        new_y = self._text_y + FONT_H + FONT_LINE_SPACING
-        if new_y + FONT_H > self._height:
+        """Commit the current line and move the insertion point below it.
+
+        Line height scales with the current text scale, so multi-line text at a
+        large scale gets the room it needs.
+        """
+        scale = self._text_scale
+        new_y = self._text_y + (FONT_H + FONT_LINE_SPACING) * scale
+        if new_y + FONT_H * scale > self._height:
             return []  # no room for another line: ignore Enter
         self._text_history.append(
             {"kind": "newline", "x": self._text_x, "y": self._text_y}
@@ -1600,10 +1652,10 @@ class CanvasApp:
         self._cursor_y = min(self._text_y, max(0, self._height - 1))
 
     def _tool_brush_dec(self) -> list[dict[str, Any]]:
-        return self._set_brush_size(self._brush_size - 1)
+        return self._set_size(self._current_size() - 1)
 
     def _tool_brush_inc(self) -> list[dict[str, Any]]:
-        return self._set_brush_size(self._brush_size + 1)
+        return self._set_size(self._current_size() + 1)
 
     def _tool_palette(self) -> list[dict[str, Any]]:
         self._palette_mode = True
@@ -1684,6 +1736,17 @@ class CanvasApp:
             if button == 0:
                 return self._text_place(cell_col, display_row * 2)
             return []  # drag/wheel with the text tool: nothing to do
+        # The brush slider is a live size control: with the text tool active it
+        # sets the text scale without finalizing the in-progress text, so a
+        # mid-session scale change only affects characters typed after it.
+        geom = self._toolbar_geometry()
+        if row == geom["row"]:
+            slider = geom["slider"]
+            if slider is not None and slider.contains(col, row):
+                if self._palette_mode:
+                    self._palette_mode = False
+                    self._pending_chrome = True
+                return self._set_size(slider.brush_size_for(col))
         # Every other press finalizes any in-progress text entry.
         self._text_finalize()
         shape = self._shape_toolbar_geometry()
@@ -1694,14 +1757,7 @@ class CanvasApp:
                         self._palette_mode = False
                         self._pending_chrome = True
                     return getattr(self, b.action)()
-        geom = self._toolbar_geometry()
         if row == geom["row"]:
-            slider = geom["slider"]
-            if slider is not None and slider.contains(col, row):
-                if self._palette_mode:
-                    self._palette_mode = False
-                    self._pending_chrome = True
-                return self._set_brush_size(slider.brush_size_for(col))
             for b in geom["buttons"]:
                 if b.contains(col, row):
                     if self._palette_mode:
@@ -1784,6 +1840,13 @@ class CanvasApp:
                 self._exit_custom_color()
             return []  # hex mode swallows every other key
         if self._text_active:
+            # With the text tool active, +/- set the text scale instead of
+            # drawing (or being ignored): the session keeps running, so the
+            # change only affects characters typed after it.
+            if ch in "+=":
+                return self._set_size(self._current_size() + 1)
+            if ch in "-_":
+                return self._set_size(self._current_size() - 1)
             return self._text_type_char(ch)  # an active text entry swallows keys
         if ch == "q":
             self._quit.set()
@@ -1826,9 +1889,9 @@ class CanvasApp:
         if ch == "t":
             return self._set_tool(TOOL_TEXT)
         if ch in "+=":
-            return self._set_brush_size(self._brush_size + 1)
+            return self._set_size(self._current_size() + 1)
         if ch in "-_":
-            return self._set_brush_size(self._brush_size - 1)
+            return self._set_size(self._current_size() - 1)
         if ch == "[":
             return self._request_resize(-1, 0)
         if ch == "]":

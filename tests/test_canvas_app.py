@@ -21,11 +21,14 @@ from canvas_app import (
     BRUSH_MIN,
     CELL_W,
     FONT_H,
+    FONT_LINE_SPACING,
+    FONT_SPACING,
     FONT_W,
     MAX_CANVAS,
     MIN_CANVAS,
     PALETTE,
     QUICK_COLORS,
+    RESET,
     TOOL_ERASER,
     TOOL_FILL,
     TOOL_FILLED_RECT,
@@ -1737,3 +1740,267 @@ def test_text_changes_are_sent_as_normal_edits():
     app._after_edit(changes)
     assert len(sent) == 1
     assert all({"x", "y", "color"} <= set(c) for c in sent[0])  # server-ready dicts
+
+
+# --------------------------------------------------------------------------- #
+# Text tool: scale control — each font pixel renders as an N x N block, the
+# brush slider / +/- keys set the scale while the text tool is active, and
+# mixed-scale sessions backspace correctly
+# --------------------------------------------------------------------------- #
+
+
+def test_glyph_pixels_scale_one_is_native_and_below_one_is_empty():
+    assert glyph_pixels("A", 3, 4, 1) == glyph_pixels("A", 3, 4)
+    assert glyph_pixels("A", 3, 4, 0) == set()
+    assert glyph_pixels("A", 3, 4, -1) == set()
+    assert glyph_pixels(" ", 0, 0, 2) == set()  # space still has no glyph box
+
+
+def test_glyph_pixels_scale_is_block_replication():
+    """Every lit font pixel becomes an N x N block of canvas pixels."""
+    lit = glyph_pixels("I", 0, 0)  # native positions, relative to the origin
+    for scale in (2, 3):
+        scaled = glyph_pixels("I", 0, 0, scale)
+        assert len(scaled) == len(lit) * scale * scale  # each pixel -> N^2
+        for fx, fy in lit:
+            for i in range(scale):
+                for j in range(scale):
+                    assert (fx * scale + i, fy * scale + j) in scaled  # the block
+        # nothing leaks outside the scaled box
+        assert all(x < FONT_W * scale and y < FONT_H * scale for x, y in scaled)
+
+
+def test_glyph_pixels_scale_offsets_position():
+    scaled = glyph_pixels("I", 3, 4, 2)
+    assert all(3 <= x < 3 + FONT_W * 2 and 4 <= y < 4 + FONT_H * 2 for x, y in scaled)
+    # "I" row 0 is ".###.", so the leftmost lit font pixel is fx=1: its 2x2
+    # block spans (3 + 2)..(3 + 3) columns and (4 + 0)..(4 + 1) rows.
+    assert {(5, 4), (6, 4), (5, 5), (6, 5)} <= scaled
+
+
+def test_text_scaled_typing_draws_blocks_and_advances_scaled():
+    app = text_app(height=24)  # scale-2 "H" is 10x14: needs y 2..15
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_scale = 2
+    app._text_place(2, 2)
+    changes = app._handle_char("H")
+    drawn = {(c["x"], c["y"]) for c in changes}
+    assert drawn == glyph_pixels("H", 2, 2, 2)  # exactly the scaled block pixels
+    assert len(changes) == len(glyph_pixels("H", 0, 0, 1)) * 4  # 4x the native
+    # every block is fully filled: both columns of a lit font pixel lit up
+    assert app._pixels[2][2] == (255, 0, 0) and app._pixels[2][3] == (255, 0, 0)
+    assert app._pixels[3][2] == (255, 0, 0) and app._pixels[3][3] == (255, 0, 0)
+    # insertion point advanced by the scaled glyph width + scaled spacing
+    assert app._text_x == 2 + (FONT_W + FONT_SPACING) * 2
+
+
+def test_text_mixed_scale_renders_without_rescaling_earlier_chars():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(0, 0)
+    app._text_scale = 1
+    app._handle_char("H")  # native: advance to 6
+    assert app._text_x == FONT_W + FONT_SPACING
+    app._text_scale = 2
+    app._handle_char("I")  # 2x: advance by 12 more
+    assert app._text_x == (FONT_W + FONT_SPACING) + (FONT_W + FONT_SPACING) * 2
+    # the earlier "H" was NOT retroactively rescaled: its pixels are the native
+    # single-pixel rows (H row 0 "#...#" -> lit at x 0 and 4), still there
+    assert app._pixels[0][0] == (255, 0, 0)  # H at scale 1, left bar
+    assert app._pixels[0][4] == (255, 0, 0)  # H at scale 1, right bar
+    assert app._pixels[0][5] == (10, 10, 10)  # the spacing column is off
+    # the later "I" at scale 2 starts at x=6: its row-0 blocks are at 8..13
+    for x in range(8, 14):
+        assert app._pixels[0][x] == (255, 0, 0)
+        assert app._pixels[1][x] == (255, 0, 0)
+    assert app._pixels[0][6] == (10, 10, 10)  # the scaled box leaves no gap
+
+
+def test_text_mixed_scale_backspace_removes_exact_characters():
+    app = text_app()
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(0, 0)
+    app._text_scale = 1
+    app._handle_char("H")
+    app._text_scale = 2
+    app._handle_char("I")
+    # backspace erases the scale-2 "I" exactly, leaving the scale-1 "H" intact
+    changes = app._handle_char("\x7f")
+    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._text_x == FONT_W + FONT_SPACING  # back to just after the H
+    for px in glyph_pixels("I", FONT_W + FONT_SPACING, 0, 2):
+        assert app._pixels[px[1]][px[0]] == (10, 10, 10)
+    for px in glyph_pixels("H", 0, 0, 1):
+        assert app._pixels[px[1]][px[0]] == (255, 0, 0)
+    # a second backspace removes the scale-1 "H"
+    app._handle_char("\x7f")
+    assert app._text_x == 0
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+def test_text_escape_reverts_scaled_session():
+    app = text_app(height=40)
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_scale = 2
+    app._text_place(1, 1)
+    app._handle_char("A")
+    app._handle_char("B")
+    changes = app._read_escape_sequence()  # a stray ESC (no CSI) cancels
+    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert app._text_active is False
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+def test_text_scale_newline_drops_scaled_height():
+    app = text_app(height=60)
+    app._tool = TOOL_TEXT
+    app._text_scale = 2
+    app._text_place(4, 2)
+    app._handle_char("A")
+    assert app._handle_char("\r") == []
+    assert app._text_x == 4  # the new line starts at the session's start x
+    assert app._text_y == 2 + (FONT_H + FONT_LINE_SPACING) * 2
+
+
+def test_text_scale_newline_out_of_bounds_ignored():
+    app = text_app(height=20)
+    app._tool = TOOL_TEXT
+    app._text_scale = 2  # each scaled line needs 16 rows: nothing fits below y=4
+    app._text_place(2, 4)
+    assert app._handle_char("\r") == []
+    assert (app._text_x, app._text_y) == (2, 4)
+
+
+def test_text_scaled_glyph_refused_at_right_edge():
+    app = text_app(width=20)
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(15, 2)
+    assert app._handle_char("H")  # native 5 wide: 15 + 5 == 20 fits
+    assert app._text_x == 15 + FONT_W + FONT_SPACING
+    app._text_scale = 2  # now the box is 10 wide: 21 + 10 > 20 -> refused
+    assert app._handle_char("I") == []
+    assert app._text_x == 15 + FONT_W + FONT_SPACING  # did not advance
+    assert all(p == (10, 10, 10) for p in app._pixels[2][21:])  # nothing past
+
+
+def test_text_scaled_glyph_refused_at_bottom_edge():
+    app = text_app(height=16)
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_scale = 3  # the box is 21 tall: 0 + 21 > 16 -> refused
+    app._text_place(0, 0)
+    assert app._handle_char("A") == []
+    assert (app._text_x, app._text_y) == (0, 0)
+
+
+def test_slider_controls_text_scale_when_text_active():
+    app = make_app()
+    app._handle_char("t")
+    assert app._tool == TOOL_TEXT
+    col, row = slider_slot(app, 5)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []  # never paints pixels
+    assert app._text_scale == 5
+    assert app._brush_size == 1  # the brush is untouched
+    # back to paint: the same slider sets the brush again
+    app._handle_char("p")
+    col, row = slider_slot(app, 3)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._brush_size == 3
+    assert app._text_scale == 5  # the text scale is preserved
+
+
+def test_slider_drag_sets_text_scale_when_text_active():
+    app = make_app()
+    app._handle_char("t")
+    s = app._toolbar_geometry()["slider"]
+    app._handle_csi(f"<0;{s.col};{s.row}", "M")  # press at size 1
+    assert app._text_scale == 1
+    app._handle_csi(f"<32;{s.col + 4};{s.row}", "M")  # drag to size 5
+    assert app._text_scale == 5
+    assert app._brush_size == 1
+
+
+def test_slider_click_mid_typing_keeps_the_session_live():
+    app = text_app(height=24)
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(2, 2)
+    app._handle_char("H")
+    # clicking the slider mid-typing changes the scale but does NOT finalize
+    col, row = slider_slot(app, 3)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._text_scale == 3
+    assert app._text_active is True
+    app._handle_char("I")
+    # Escape still reverts the WHOLE mixed-scale session
+    changes = app._read_escape_sequence()
+    assert changes and all(c["color"] == [10, 10, 10] for c in changes)
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+def test_plus_minus_keys_set_text_scale_when_text_active():
+    app = make_app()
+    app._handle_char("t")
+    app._handle_char("+")
+    assert app._text_scale == 2
+    assert app._brush_size == 1
+    app._handle_char("=")
+    assert app._text_scale == 3
+    app._handle_char("-")
+    assert app._text_scale == 2
+    app._text_scale = BRUSH_MAX
+    app._handle_char("+")  # clamps at the top
+    assert app._text_scale == BRUSH_MAX
+    # back to paint: +/- grow the brush again
+    app._handle_char("p")
+    app._handle_char("+")
+    assert app._brush_size == 2
+    assert app._text_scale == BRUSH_MAX
+
+
+def test_plus_minus_keys_work_mid_typing():
+    app = text_app(height=24)
+    app._tool = TOOL_TEXT
+    app._color = (255, 0, 0)
+    app._text_place(0, 0)
+    app._handle_char("H")  # native: advance to 6
+    app._handle_char("+")  # scale up mid-session (not a literal "+" glyph)
+    assert app._text_scale == 2
+    assert app._text_active is True  # the session kept running
+    app._handle_char("I")
+    assert app._text_x == (FONT_W + FONT_SPACING) + (FONT_W + FONT_SPACING) * 2
+    # the H stayed at its original scale
+    assert app._pixels[0][0] == (255, 0, 0)
+    # backspace removes the scale-2 I, then the scale-1 H
+    app._handle_char("\x7f")
+    assert app._text_x == FONT_W + FONT_SPACING
+    app._handle_char("\x7f")
+    assert app._text_x == 0
+    assert all(p == (10, 10, 10) for row in app._pixels for p in row)
+
+
+def test_status_line_shows_text_size_when_text_active():
+    app = make_app((200, 40))  # a terminal wide enough that the header isn't truncated
+    app._text_scale = 4
+    assert f"brush {app._brush_size}" in app._render_top_line()
+    assert "text size" not in app._render_top_line()
+    app._tool = TOOL_TEXT
+    assert "text size 4" in app._render_top_line()
+    assert f"brush {app._brush_size}" not in app._render_top_line()
+
+
+def test_slider_handle_renders_at_text_scale():
+    app = make_app()
+    app._handle_char("t")
+    app._text_scale = 3
+    rendered = app._render_toolbar()
+    s = app._toolbar_geometry()["slider"]
+    marker = f"\x1b[{s.row};{s.col}H"
+    idx = rendered.index(marker) + len(marker)
+    expected = "─" * 2 + f"\x1b[7m●{RESET}" + "─" * (BRUSH_MAX - 3)
+    assert rendered[idx:idx + len(expected)] == expected
