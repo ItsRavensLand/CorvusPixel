@@ -250,18 +250,22 @@ def test_labels_sync_over_socket_and_see_canvas() -> None:
             assert initial["type"] == "full"
             assert initial["labels"] == []
 
-            # A window broadcasts its annotations; the server stores them and
+            # A window broadcasts its label objects; the server stores them and
             # pushes a labels message to every connected window.
             app = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             app.connect(sock_path)
             app.sendall(
                 (json.dumps(
-                    {"type": "labels", "labels": [[0, 1, "HI", [255, 0, 0]]]}
+                    {"type": "labels",
+                     "labels": [{"id": 1, "lines": [[0, 1, "HI"]],
+                                 "color": [255, 0, 0]}]}
                 ) + "\n").encode()
             )
             msg = fake.read_message()
             assert msg["type"] == "labels"
-            assert msg["labels"] == [[0, 1, "HI", [255, 0, 0]]]
+            assert msg["labels"] == [
+                {"id": 1, "lines": [[0, 1, "HI"]], "color": [255, 0, 0]}
+            ]
 
             # see_canvas lists the annotations with position and color.
             out = cs.see_canvas()
@@ -273,7 +277,9 @@ def test_labels_sync_over_socket_and_see_canvas() -> None:
             fake2 = FakeRenderer(sock_path)
             fake2.connect()
             full = fake2.read_message()
-            assert full["labels"] == [[0, 1, "HI", [255, 0, 0]]]
+            assert full["labels"] == [
+                {"id": 1, "lines": [[0, 1, "HI"]], "color": [255, 0, 0]}
+            ]
 
             # init_canvas resets the labels along with the pixels.
             cs.reset(4, 4, (5, 5, 5))

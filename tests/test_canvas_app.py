@@ -38,8 +38,11 @@ from canvas_app import (
     TOOL_LINE,
     TOOL_LABEL,
     TOOL_PAINT,
+    TOOL_SELECT,
     TOOL_TEXT,
-    label_runs_from_cells,
+    LabelObject,
+    SELECTION_COLOR,
+    label_border_cells,
     _FONT5X7,
     CanvasApp,
     ToolButton,
@@ -48,6 +51,8 @@ from canvas_app import (
     flood_fill_region,
     glyph_pixels,
     hollow_rect_cells,
+    label_cells,
+    label_hitbox,
     square_end,
     thick_line_cells,
 )
@@ -1262,7 +1267,7 @@ def test_shape_toolbar_right_aligned_and_selects():
     assert shape["row"] == app._layout_info["top_pad"] + 1  # the header row
     assert [b.ident for b in shape["buttons"]] == [
         "filled_rect", "filled_square", "hollow_rect", "hollow_square", "line",
-        "fill", "text", "label",
+        "fill", "text", "label", "select",
     ]
     last = shape["buttons"][-1]
     assert last.col + last.width - 1 <= 80  # right-aligned, fits the terminal
@@ -1319,11 +1324,11 @@ def wide_app() -> CanvasApp:
 def test_shortcuts_panel_full_grouping_on_wide_terminal():
     app = wide_app()
     # The quick-colour row leaves a 57-column left margin: all six groups fit,
-    # packed into lines with a short labelled header per group. "a" joined the
-    # Shapes group, so Other now spills onto its own (third) line.
+    # packed into lines with a short labelled header per group. "a" (label) and
+    # "v" (select) joined the Shapes group, so Other spills onto its own line.
     assert app._shortcuts_panel(avail=57) == [
         [("Move", "←↑↓→"), ("Draw", "space·x·e"), ("Brush", "+·−")],
-        [("Shapes", "p·r·o·f·s·l·b·t·a"), ("Canvas", "[ ]·{ }·Tab")],
+        [("Shapes", "p·r·o·f·s·l·b·t·a·v"), ("Canvas", "[ ]·{ }·Tab")],
         [("Other", "c·1-8·q")],
     ]
 
@@ -2020,19 +2025,40 @@ def label_screen(app: CanvasApp, trow: int, tcol: int) -> tuple[int, int]:
     return (l["left_pad"] + tcol + 1, l["top_pad"] + 3 + trow)
 
 
-def test_label_runs_from_cells_groups_runs():
-    """Consecutive same-colour cells on a row merge; others split the run."""
-    cells = {
-        (0, 0): ("H", (255, 0, 0)),
-        (0, 1): ("i", (255, 0, 0)),
-        (0, 2): ("!", (0, 0, 255)),  # colour change splits the run
-        (2, 5): ("x", (255, 0, 0)),  # a lone cell on its own row
+def test_label_cells_expands_object():
+    """A stored label object expands into one overlay cell per character."""
+    obj = LabelObject(1, [(0, 2, "Hi")], (255, 0, 0))
+    assert label_cells(obj) == {
+        (0, 2): ("H", (255, 0, 0)),
+        (0, 3): ("i", (255, 0, 0)),
     }
-    assert label_runs_from_cells(cells) == [
-        (0, 0, "Hi", (255, 0, 0)),
-        (0, 2, "!", (0, 0, 255)),
-        (2, 5, "x", (255, 0, 0)),
-    ]
+    multi = LabelObject(2, [(1, 1, "ab"), (3, 5, "x")], (0, 0, 255))
+    assert label_cells(multi) == {
+        (1, 1): ("a", (0, 0, 255)),
+        (1, 2): ("b", (0, 0, 255)),
+        (3, 5): ("x", (0, 0, 255)),
+    }
+
+
+def test_label_hitbox_single_and_multi_line():
+    """The hitbox is the bounding rectangle over every rendered character."""
+    assert label_hitbox(LabelObject(1, [(0, 2, "Hi")], (255, 0, 0))) == (0, 2, 0, 3)
+    obj = LabelObject(2, [(1, 1, "abc"), (3, 5, "xy")], (255, 0, 0))
+    assert label_hitbox(obj) == (1, 1, 3, 6)  # rows 1..3, cols 1..6
+    assert label_hitbox(LabelObject(3, [], (255, 0, 0))) is None
+
+
+def test_label_border_cells_rings_the_hitbox():
+    """The selection border wraps the hitbox one cell out on every side."""
+    border = label_border_cells((0, 2, 0, 4))
+    assert border[(0 - 1, 2 - 1)] == "┌"
+    assert border[(0 - 1, 4 + 1)] == "┐"
+    assert border[(0 + 1, 2 - 1)] == "└"
+    assert border[(0 + 1, 4 + 1)] == "┘"
+    assert border[(0, 2 - 1)] == "│" and border[(0, 4 + 1)] == "│"
+    assert border[(0 - 1, 3)] == "─"
+    # the ring never overlaps a label character cell
+    assert all((r, c) not in {(0, 2), (0, 3), (0, 4)} for (r, c) in border)
 
 
 def test_label_cell_maps_click_to_terminal_coords():
@@ -2053,6 +2079,16 @@ def test_label_hotkey_and_button_select():
     b = next(bt for bt in shape["buttons"] if bt.ident == "label")
     assert app._handle_csi(f"<0;{b.col};{b.row}", "M") == []
     assert app._tool == TOOL_LABEL
+
+
+def test_select_tool_hotkey_and_button_select():
+    app = make_app()
+    assert app._handle_char("v") == []
+    assert app._tool == TOOL_SELECT
+    shape = app._shape_toolbar_geometry()
+    b = next(bt for bt in shape["buttons"] if bt.ident == "select")
+    assert app._handle_csi(f"<0;{b.col};{b.row}", "M") == []
+    assert app._tool == TOOL_SELECT
 
 
 def test_label_click_starts_session():
@@ -2091,17 +2127,18 @@ def test_label_backspace_removes_last_char():
     assert (app._label_row, app._label_col) == (0, 0)
 
 
-def test_label_backspace_empty_session_removes_existing_label():
+def test_label_backspace_empty_session_is_noop():
+    """Backspace on an empty fresh session is a no-op — it never touches a
+    stored label. (The select tool's Delete removes whole labels instead.)"""
     app = text_app()
     app._color = (255, 0, 0)
     app._label_place(0, 1)
-    app._handle_char("H")  # finalized label char at (0,1)
+    app._handle_char("H")
     app._label_finalize()
-    assert (0, 1) in app._label_cells
+    assert app._labels == [LabelObject(1, [(0, 1, "H")], (255, 0, 0))]
     app._label_place(0, 2)  # a fresh session right after the char
     assert app._handle_char("\x7f") == []
-    assert (0, 1) not in app._label_cells  # the stored char is removed
-    assert (0, 1) in app._label_removed  # and kept so Escape can restore it
+    assert app._labels == [LabelObject(1, [(0, 1, "H")], (255, 0, 0))]
 
 
 def test_label_enter_new_line():
@@ -2121,21 +2158,7 @@ def test_label_escape_cancels_session():
     app._read_escape_sequence()  # a stray ESC (no CSI) cancels the session
     assert app._label_active is False
     assert app._label_session_cells == {}
-    assert app._label_cells == {}  # nothing committed
-
-
-def test_label_escape_restores_removed_existing():
-    app = text_app()
-    app._color = (255, 0, 0)
-    app._label_place(0, 1)
-    app._handle_char("H")
-    app._label_finalize()
-    app._label_place(0, 2)
-    app._handle_char("\x7f")  # removes the stored (0,1) "H"
-    assert (0, 1) not in app._label_cells
-    app._read_escape_sequence()  # a stray ESC cancels + restores the removed char
-    assert app._label_active is False
-    assert app._label_cells[(0, 1)] == ("H", (255, 0, 0))
+    assert app._labels == []  # nothing committed
 
 
 def test_label_finalize_commits():
@@ -2146,9 +2169,8 @@ def test_label_finalize_commits():
     app._handle_char("i")
     app._label_finalize()
     assert app._label_active is False
-    assert app._label_cells[(0, 0)] == ("H", (255, 0, 0))
-    assert app._label_cells[(0, 1)] == ("i", (255, 0, 0))
-    assert app._labels == [(0, 0, "Hi", (255, 0, 0))]
+    assert app._labels == [LabelObject(1, [(0, 0, "Hi")], (255, 0, 0))]
+    assert app._label_next_id == 2  # the next fresh session gets a new id
 
 
 def test_label_right_edge_stops():
@@ -2179,9 +2201,8 @@ def test_label_tool_switch_finalizes():
     b = app._shape_toolbar_geometry()["buttons"][0]  # the filled-rect button
     app._handle_csi(f"<0;{b.col};{b.row}", "M")  # switch tool via the mouse
     assert app._tool == TOOL_FILLED_RECT
-    assert app._label_active is False  # finalized: merged into the stored store
-    assert app._label_cells[(0, 0)] == ("H", (255, 0, 0))
-    assert app._label_cells[(0, 1)] == ("p", (255, 0, 0))
+    assert app._label_active is False  # finalized into a stored object
+    assert app._labels == [LabelObject(1, [(0, 0, "Hp")], (255, 0, 0))]
 
 
 def test_label_char_overwrites_pixel_block():
@@ -2207,7 +2228,7 @@ def test_label_char_overwrites_pixel_block():
 
 
 def test_label_removal_restores_pixel_cell():
-    """Removing a label char restores the pixel-block content underneath."""
+    """Deleting a label (select tool) restores the pixel content underneath."""
     app = make_app()
     app._color = (255, 0, 0)
     app._paint_pixel(0, 0, (255, 0, 0))
@@ -2215,14 +2236,19 @@ def test_label_removal_restores_pixel_cell():
     app._label_place(0, 0)
     app._handle_char("X")
     app._label_finalize()
+    assert app._labels == [LabelObject(1, [(0, 0, "X")], (0, 0, 255))]
     app._draw()
     baseline = app._console.file.getvalue()
     l = app._layout_info
     pos = f"\x1b[{l['top_pad'] + 3};{l['left_pad'] + 1}H"
     assert "X" in baseline
-    # a fresh session right after the char, then backspace removes it
-    app._label_place(0, 1)
-    app._handle_char("\x7f")
+    # select the label with the select tool and delete it
+    app._tool = TOOL_SELECT
+    col, row = label_screen(app, 0, 0)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_label_id == 1
+    assert app._handle_char("\x7f") == []
+    assert app._labels == []  # the object is gone entirely
     app._draw()
     delta = app._console.file.getvalue()[len(baseline):]
     assert pos in delta  # the pixel cell is rewritten
@@ -2230,16 +2256,208 @@ def test_label_removal_restores_pixel_cell():
     assert "X" not in delta  # the label char is gone
 
 
-def test_app_apply_labels_message_replaces_annotations():
-    """A server labels broadcast replaces the whole store (another window)."""
+def test_app_apply_labels_message_replaces_objects():
+    """A server labels broadcast replaces the whole object store (another
+    window), bumps the id counter, and clears a selection that vanished."""
     app = text_app()
-    app._color = (255, 0, 0)
-    app._label_place(0, 0)
-    app._handle_char("H")
+    app._labels = [LabelObject(1, [(1, 2, "Hi")], (255, 0, 0))]
+    app._label_next_id = 2
+    app._selected_label_id = 1
+    app._apply({
+        "type": "labels",
+        "labels": [{"id": 7, "lines": [[0, 2, "AB"], [2, 0, "z"]],
+                    "color": [0, 0, 255]}],
+    })
+    assert [o.label_id for o in app._labels] == [7]
+    assert app._labels[0].lines == [(0, 2, "AB"), (2, 0, "z")]
+    assert app._labels[0].color == (0, 0, 255)
+    assert app._selected_label_id is None  # id 1 no longer exists
+    assert app._label_next_id == 8  # future ids stay ahead of what we received
+
+
+def test_label_wire_reflects_objects():
+    """The wire representation is the object model, one dict per label."""
+    app = label_select_app()
+    assert app._label_wire() == [
+        {"id": 1, "lines": [[1, 2, "Hi"]], "color": [255, 0, 0]},
+        {"id": 2, "lines": [[4, 5, "yo"]], "color": [0, 255, 0]},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Select tool: clicking, moving, deleting and editing label objects
+# --------------------------------------------------------------------------- #
+
+
+def label_select_app() -> CanvasApp:
+    """A text_app with two stored label objects and the select tool active."""
+    app = text_app()
+    app._labels = [
+        LabelObject(1, [(1, 2, "Hi")], (255, 0, 0)),
+        LabelObject(2, [(4, 5, "yo")], (0, 255, 0)),
+    ]
+    app._label_next_id = 3
+    app._last_label_wire = app._label_wire()
+    app._tool = TOOL_SELECT
+    return app
+
+
+def test_label_at_finds_topmost_hitbox():
+    app = label_select_app()
+    assert app._label_at(1, 3).label_id == 1  # inside "Hi"
+    assert app._label_at(4, 5).label_id == 2  # inside "yo"
+    assert app._label_at(0, 0) is None  # empty space
+    # overlapping labels: the later one (drawn on top) wins
+    app._labels.append(LabelObject(3, [(1, 3, "!!")], (0, 0, 255)))
+    assert app._label_at(1, 3).label_id == 3
+
+
+def test_select_tool_click_selects_switches_and_deselects():
+    app = label_select_app()
+    col, row = label_screen(app, 1, 3)  # inside "Hi"
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._selected_label_id == 1
+    # clicking the other label switches the selection
+    col, row = label_screen(app, 4, 6)  # inside "yo"
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._selected_label_id == 2
+    # clicking empty canvas space deselects
+    col, row = label_screen(app, 0, 30)  # inside the canvas, far from both
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._selected_label_id is None
+
+
+def test_select_tool_only_one_selected_at_a_time():
+    app = label_select_app()
+    for trow, tcol in [(1, 2), (4, 5), (1, 3), (4, 6)]:
+        col, row = label_screen(app, trow, tcol)
+        app._handle_csi(f"<0;{col};{row}", "M")
+        assert app._selected_label_id in (1, 2)  # always exactly one
+    matched = [o.label_id for o in app._labels
+               if o.label_id == app._selected_label_id]
+    assert matched == [2]
+
+
+def test_selection_border_renders_around_selected_label():
+    app = label_select_app()
+    app._draw()
+    baseline = app._console.file.getvalue()
+    col, row = label_screen(app, 1, 2)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    app._draw()
+    delta = app._console.file.getvalue()[len(baseline):]
+    sel = f"\x1b[38;2;{SELECTION_COLOR[0]};{SELECTION_COLOR[1]};{SELECTION_COLOR[2]}m"
+    assert sel in delta  # the border ring draws in the selection colour
+    assert "┌" in delta and "┘" in delta
+    # deselecting clears the border on the next full redraw
+    col, row = label_screen(app, 0, 30)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    app._draw()
+    delta2 = app._console.file.getvalue()[len(baseline) + len(delta):]
+    assert sel not in delta2
+
+
+def test_select_tool_drag_moves_label_with_preview_and_commit():
+    app = label_select_app()
+    app._draw()
+    baseline = app._console.file.getvalue()
+    # press on "Hi" at (1,2); its hitbox top-left is (1,2), so the drag
+    # offset is (0,0) and the label follows the cursor exactly
+    col, row = label_screen(app, 1, 2)
+    assert app._handle_csi(f"<0;{col};{row}", "M") == []
+    assert app._label_drag_id == 1
+    # motion to (3,5): a dimmed preview moves there, the stored object untouched
+    col, row = label_screen(app, 3, 5)
+    assert app._handle_csi(f"<32;{col};{row}", "M") == []
+    assert app._label_drag_preview is not None
+    assert app._label_drag_preview.lines == [(3, 5, "Hi")]
+    assert app._labels[0].lines == [(1, 2, "Hi")]
+    app._draw()
+    delta = app._console.file.getvalue()[len(baseline):]
+    assert "\x1b[38;2;102;0;0m" in delta  # 40% of (255,0,0) preview dim
+    # release commits the move
+    assert app._handle_csi(f"<0;{col};{row}", "m") == []
+    assert app._labels[0].lines == [(3, 5, "Hi")]
+    assert app._label_drag_preview is None
+    assert app._selected_label_id == 1
+
+
+def test_select_tool_drag_clamps_to_canvas():
+    app = label_select_app()
+    col, row = label_screen(app, 1, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    # drag far past the bottom-right edge: the label stays on the canvas
+    col, row = label_screen(app, 7, 79)  # the last terminal row/column
+    app._handle_csi(f"<32;{col};{row}", "M")
+    layout = app._compute_layout()
+    assert app._label_drag_preview.lines == [
+        (layout["canvas_rows"] - 1, app._width * CELL_W - 2, "Hi")
+    ]
+
+
+def test_select_tool_delete_removes_label_object():
+    app = label_select_app()
+    col, row = label_screen(app, 1, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._selected_label_id == 1
+    assert app._handle_char("\x7f") == []  # Delete/Backspace removes the object
+    assert [o.label_id for o in app._labels] == [2]
+    assert app._selected_label_id is None
+    assert app._handle_char("\x7f") == []  # nothing selected: no-op
+    assert [o.label_id for o in app._labels] == [2]
+
+
+def test_select_tool_enter_edits_in_place_escape_reverts():
+    app = label_select_app()
+    col, row = label_screen(app, 1, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    assert app._handle_char("\r") == []  # Enter: re-open for in-place editing
+    assert app._label_active is True
+    assert app._label_edit_oid == 1
+    assert (app._label_row, app._label_col) == (1, 4)  # caret at the end of "Hi"
+    app._handle_char("!")
+    assert app._label_session_cells[(1, 4)] == ("!", (255, 0, 0))
+    assert app._labels[0].lines == [(1, 2, "Hi")]  # stored object untouched
+    app._read_escape_sequence()  # Escape reverts to the pre-edit content
+    assert app._label_active is False
+    assert app._label_edit_oid is None
+    assert app._labels[0].lines == [(1, 2, "Hi")]
+    assert app._label_session_cells == {}
+
+
+def test_select_tool_edit_finalize_commits_and_empty_removes():
+    app = label_select_app()
+    # commit an in-place edit: the same object id, new text
+    col, row = label_screen(app, 1, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    app._handle_char("\r")
+    app._handle_char("!")
     app._label_finalize()
-    assert app._labels == [(0, 0, "H", (255, 0, 0))]
-    app._apply({"type": "labels", "labels": [[0, 2, "AB", [0, 0, 255]]]})
-    assert app._labels == [(0, 2, "AB", (0, 0, 255))]
-    assert app._label_cells[(0, 2)] == ("A", (0, 0, 255))
-    assert app._label_cells[(0, 3)] == ("B", (0, 0, 255))
-    assert (0, 0) not in app._label_cells
+    assert app._labels[0] == LabelObject(1, [(1, 2, "Hi!")], (255, 0, 0))
+    # editing everything away deletes the object
+    app._handle_char("\r")  # re-open again
+    app._handle_char("\x7f")  # "Hi!" -> "Hi"
+    app._handle_char("\x7f")  # "Hi" -> "H"
+    app._handle_char("\x7f")  # "H" -> ""
+    assert app._label_session_cells == {}
+    app._label_finalize()
+    assert [o.label_id for o in app._labels] == [2]
+    assert app._selected_label_id is None
+
+
+def test_selecting_and_deleting_never_touches_pixels():
+    """Selection, moving and deleting operate on label objects only — the
+    pixel canvas is never written."""
+    app = label_select_app()
+    pixels_before = [row[:] for row in app._pixels]
+    col, row = label_screen(app, 1, 2)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    app._handle_char("\x7f")
+    assert app._pixels == pixels_before
+    # moving the remaining label around changes nothing on the pixel grid
+    col, row = label_screen(app, 4, 5)
+    app._handle_csi(f"<0;{col};{row}", "M")
+    col, row = label_screen(app, 6, 8)
+    app._handle_csi(f"<32;{col};{row}", "M")
+    app._handle_csi(f"<0;{col};{row}", "m")
+    assert app._pixels == pixels_before

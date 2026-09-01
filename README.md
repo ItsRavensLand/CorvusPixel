@@ -63,9 +63,16 @@ session it just says "Canvas already open in this session."
   characters in the terminal's own font — crisp at any size — right over the
   pixel grid in the current color, Backspace removes the last character, Enter
   starts a new line below, Escape cancels the whole in-progress label, and
-  clicking elsewhere or switching tools finalizes it. Labels are stored
-  separately from the pixels (as `(row, col, text, color)` annotations) and
-  show up in `see_canvas`.
+  clicking elsewhere or switching tools finalizes it. Every finished label is a
+  single selectable object with its own id, position (per line), text and
+  color; the **select** tool (`v`) clicks inside a label's box to select it (a
+  cyan border wraps the whole thing), click-drags to move it (a dimmed preview
+  follows the cursor; release commits the new position), Delete or Backspace
+  removes it entirely, and Enter re-opens it for in-place editing — cursor at
+  the end of the text, Backspace/typing modify it in place, Escape reverts to
+  the pre-edit content (it never deletes). Only one label is selected at a
+  time, and selection never touches the pixel grid. Labels show up in
+  `see_canvas`.
 - **Keyboard**
   - A live reminder of all these shortcuts sits in the bottom-left corner of the
     window, packed into small labelled groups (move / draw / brush / shapes /
@@ -87,7 +94,10 @@ session it just says "Canvas already open in this session."
     while this tool is active the brush bar / `+` `-` set the text scale ·
     `a` — label tool: click to place a terminal-cell caret, type literal
     terminal characters right over the pixels, Backspace removes the last one,
-    Enter drops a line, Escape cancels the whole in-progress label
+    Enter drops a line, Escape cancels the whole in-progress label ·
+    `v` — select tool: click inside a label to select it (a cyan border wraps
+    its box), drag to move it, Delete/Backspace removes it, Enter re-opens it
+    for in-place editing (Escape reverts)
   - `+`/`-` — grow/shrink the square brush (1×1 … 7×7, centred on the cursor;
     the toolbar's brush bar does the same with the mouse). With the **text tool
     active** they set the text scale instead (each font pixel draws as an N×N

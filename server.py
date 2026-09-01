@@ -494,10 +494,11 @@ class CanvasServer:
         self._lock = threading.RLock()
         self._canvas = PixelCanvas(width, height, background)
         self._sink = RendererSink(socket_path)
-        # Terminal-text annotations shared with canvas windows, in (row, col,
-        # text, color) form with terminal-cell (not pixel) coordinates. Kept in
-        # sync with every connected window and shown by see_canvas().
-        self._labels: list[list[Any]] = []
+        # Terminal-text label objects shared with canvas windows, in
+        # {"id", "lines": [[row, col, text], ...], "color"} form with
+        # terminal-cell (not pixel) coordinates. Kept in sync with every
+        # connected window and shown by see_canvas().
+        self._labels: list[dict[str, Any]] = []
 
     def start(self) -> None:
         """Start accepting canvas-window connections (call before ``server.run()``)."""
@@ -550,24 +551,33 @@ class CanvasServer:
             self._sink.push({"type": "full", **self._canvas.snapshot()})
 
     def _apply_labels(self, labels: list[Any]) -> None:
-        """Store the annotation list sent by a canvas window and rebroadcast it,
-        so every connected window (and see_canvas) stays in sync."""
+        """Store the label-object list sent by a canvas window and rebroadcast
+        it, so every connected window (and see_canvas) stays in sync."""
         with self._lock:
-            cleaned: list[list[Any]] = []
+            cleaned: list[dict[str, Any]] = []
             for entry in labels:
-                if not (isinstance(entry, list) and len(entry) == 4):
+                if not (isinstance(entry, dict)
+                        and "id" in entry and "lines" in entry and "color" in entry):
                     continue
-                row, col, text, color = entry
-                if not (isinstance(row, int) and isinstance(col, int)
-                        and isinstance(text, str)):
+                oid = entry["id"]
+                if not isinstance(oid, int):
                     continue
                 try:
-                    rgb = [int(c) for c in color]
+                    rgb = [int(c) for c in entry["color"]]
                 except (TypeError, ValueError):
                     continue
                 if len(rgb) != 3:
                     continue
-                cleaned.append([row, col, text, rgb])
+                lines: list[list[Any]] = []
+                for line in entry["lines"]:
+                    if not (isinstance(line, list) and len(line) == 3):
+                        continue
+                    row, col, text = line
+                    if not (isinstance(row, int) and isinstance(col, int)
+                            and isinstance(text, str)):
+                        continue
+                    lines.append([row, col, text])
+                cleaned.append({"id": oid, "lines": lines, "color": rgb})
             self._labels = cleaned
             self._sink.push({"type": "labels", "labels": self._labels})
 
@@ -578,7 +588,7 @@ class CanvasServer:
             width = max(1, min(width, 100))  # mirror the resize-path bounds
             height = max(1, min(height, 100))
             self._canvas = PixelCanvas(width, height, background)
-            self._labels = []  # a fresh canvas has no text annotations
+            self._labels = []  # a fresh canvas has no label objects
             self._sink.push({"type": "full", **self._canvas.snapshot()})
             return (
                 f"canvas initialized to {width}x{height} "
@@ -619,10 +629,12 @@ class CanvasServer:
             out = compact_view(self._canvas)
             if self._labels:
                 parts = ["labels (terminal rows/cols):"]
-                for row, col, text, color in self._labels:
-                    parts.append(
-                        f'  row {row}, col {col}: "{text}" in {hex_str(tuple(color))}'
-                    )
+                for label in self._labels:
+                    for row, col, text in label["lines"]:
+                        parts.append(
+                            f'  label {label["id"]}: row {row}, col {col}: '
+                            f'"{text}" in {hex_str(tuple(label["color"]))}'
+                        )
                 out += "\n" + "\n".join(parts)
             return out
 

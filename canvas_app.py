@@ -89,6 +89,7 @@ import termios
 import threading
 import time
 import tty
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from rich.console import Console
@@ -219,6 +220,7 @@ TOOL_LINE = "line"
 TOOL_FILL = "fill"
 TOOL_TEXT = "text"
 TOOL_LABEL = "label"
+TOOL_SELECT = "select"
 
 SHAPE_TOOLS = (
     TOOL_FILLED_RECT,
@@ -239,14 +241,15 @@ _TOOL_LABELS: dict[str, str] = {
     TOOL_FILL: "fill",
     TOOL_TEXT: "text",
     TOOL_LABEL: "label",
+    TOOL_SELECT: "select",
 }
 
 # The drawing tools, shown right-aligned on the top (header) row — a distinct
 # region from the centered toolbar. Same (ident, label, icon, action) convention
 # as ``_TOOLBAR_SPEC`` so rendering and hit-testing share one spec. The fill,
-# text and label tools are click tools, not click-drag shapes, so they are NOT
-# in ``SHAPE_TOOLS`` (that tuple drives the drag -> preview -> commit state
-# machine).
+# text, label and select tools are click tools, not click-drag shapes, so they
+# are NOT in ``SHAPE_TOOLS`` (that tuple drives the drag -> preview -> commit
+# state machine for the pixel shapes; the select tool has its own label drag).
 _SHAPE_SPEC: list[tuple[str, str, str, str]] = [
     ("filled_rect", "[FR]", "▬", "_tool_filled_rect"),
     ("filled_square", "[FS]", "■", "_tool_filled_square"),
@@ -256,6 +259,7 @@ _SHAPE_SPEC: list[tuple[str, str, str, str]] = [
     ("fill", "[Fill]", "▩", "_tool_fill"),
     ("text", "[Text]", "A", "_tool_text"),
     ("label", "[Label]", "⌨", "_tool_label"),
+    ("select", "[Sel]", "⌖", "_tool_select"),
 ]
 
 # The keyboard-shortcut help panel in the bottom-left margin of the chrome:
@@ -265,7 +269,7 @@ _SHORTCUT_GROUPS: list[tuple[str, list[str]]] = [
     ("Move", ["←↑↓→"]),
     ("Draw", ["space", "x", "e"]),
     ("Brush", ["+", "−"]),
-    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t", "a"]),
+    ("Shapes", ["p", "r", "o", "f", "s", "l", "b", "t", "a", "v"]),
     ("Canvas", ["[ ]", "{ }", "Tab"]),
     ("Other", ["c", "1-8", "q"]),
 ]
@@ -547,46 +551,86 @@ def glyph_pixels(char: str, x: int, y: int, scale: int = 1) -> set[tuple[int, in
 
 
 # --------------------------------------------------------------------------- #
-# Label tool: literal terminal text overlaid on the pixel grid (pure helpers)
+# Label objects: literal terminal text overlaid on the pixel grid (pure helpers)
 # --------------------------------------------------------------------------- #
 
-# Labels are stored as a separate list of annotations ``(row, col, text,
-# color)`` where (row, col) is a terminal cell inside the canvas display area
-# (NOT a canvas pixel). They are never merged into the pixel grid: the canvas
-# draws as usual and the annotations are overlaid on top, character by
-# character, at whole-terminal-cell resolution. Internally the store is a
-# per-cell dict so editing/removing is cell-based; the annotation list is
-# derived from it (and is what gets synced to the server and shown by
-# ``see_canvas``).
+# Each text-entry session becomes ONE label object: an id, the per-line start
+# (row, col) and text of every line it rendered, and a single colour. The
+# hitbox — the bounding rectangle covering every character cell the label
+# renders — is computed on demand; the select tool uses it for hit-testing,
+# move and delete. Labels are never merged into the pixel grid: the canvas
+# draws as usual and the label characters are overlaid on top, one terminal
+# cell at a time, at whole-terminal-cell resolution. The objects themselves are
+# what sync to the server and what see_canvas shows.
 
 
-def label_runs_from_cells(
-    cells: dict[tuple[int, int], tuple[str, Color]],
-) -> list[tuple[int, int, str, Color]]:
-    """Group a per-cell label store into ``(row, col, text, color)`` annotations.
+@dataclass
+class LabelObject:
+    """One terminal-text label: an id, per-line ``(row, col, text)`` starts in
+    typing order, and a single colour. ``lines`` is in terminal-cell
+    coordinates (NOT canvas pixels)."""
+    label_id: int
+    lines: list[tuple[int, int, str]]
+    color: Color
 
-    Each maximal run of consecutive same-colour cells on a row becomes one
-    annotation, so the list is compact and human-readable no matter how the
-    cells were edited.
-    """
-    out: list[tuple[int, int, str, Color]] = []
-    for row in sorted({r for r, _c in cells}):
-        cols = sorted(c for r, c in cells if r == row)
-        run_start = cols[0]
-        run_color = cells[(row, cols[0])][1]
-        run_chars = [cells[(row, cols[0])][0]]
-        prev = cols[0]
-        for col in cols[1:]:
-            char, color = cells[(row, col)]
-            if col == prev + 1 and color == run_color:
-                run_chars.append(char)
-            else:
-                out.append((row, run_start, "".join(run_chars), run_color))
-                run_start, run_color = col, color
-                run_chars = [char]
-            prev = col
-        out.append((row, run_start, "".join(run_chars), run_color))
+
+# The selection border draws in this bright colour so it stands out against
+# both the pixel grid and any label text around it.
+SELECTION_COLOR: Color = (0, 255, 255)
+
+
+def label_cells(obj: LabelObject) -> dict[tuple[int, int], tuple[str, Color]]:
+    """Expand a label object into its per-cell overlay:
+    ``{(row, col): (char, color)}`` for every character it renders."""
+    out: dict[tuple[int, int], tuple[str, Color]] = {}
+    for row, col, text in obj.lines:
+        for i, char in enumerate(text):
+            out[(row, col + i)] = (char, obj.color)
     return out
+
+
+def label_hitbox(obj: LabelObject) -> tuple[int, int, int, int] | None:
+    """The bounding rectangle ``(row_min, col_min, row_max, col_max)`` covering
+    every character cell the label renders, or None for an empty label."""
+    cells = label_cells(obj)
+    if not cells:
+        return None
+    rows = [r for r, _c in cells]
+    cols = [c for _r, c in cells]
+    return min(rows), min(cols), max(rows), max(cols)
+
+
+def hitbox_from_cells(
+    cells: dict[tuple[int, int], tuple[str, Color]],
+) -> tuple[int, int, int, int] | None:
+    """The bounding rectangle over a set of overlay cells, or None if empty."""
+    if not cells:
+        return None
+    rows = [r for r, _c in cells]
+    cols = [c for _r, c in cells]
+    return min(rows), min(cols), max(rows), max(cols)
+
+
+def label_border_cells(
+    hitbox: tuple[int, int, int, int],
+) -> dict[tuple[int, int], str]:
+    """The selection-border ring around a hitbox: ``{(row, col): box char}``.
+
+    One cell outside the rectangle on every side (corners included), so the
+    border wraps the label without covering any of its characters."""
+    r0, c0, r1, c1 = hitbox
+    cells: dict[tuple[int, int], str] = {}
+    for c in range(c0 - 1, c1 + 2):
+        cells[(r0 - 1, c)] = "─"
+        cells[(r1 + 1, c)] = "─"
+    for r in range(r0, r1 + 1):
+        cells[(r, c0 - 1)] = "│"
+        cells[(r, c1 + 1)] = "│"
+    cells[(r0 - 1, c0 - 1)] = "┌"
+    cells[(r0 - 1, c1 + 1)] = "┐"
+    cells[(r1 + 1, c0 - 1)] = "└"
+    cells[(r1 + 1, c1 + 1)] = "┘"
+    return cells
 
 
 # --------------------------------------------------------------------------- #
@@ -648,29 +692,46 @@ class CanvasApp:
         self._text_history: list[dict[str, Any]] = []
         self._text_undo: dict[tuple[int, int], Color] = {}
 
-        # Stored terminal-text annotations: a separate list of (row, col, text,
-        # color) tuples in terminal-cell coordinates (NOT canvas pixels), kept in
-        # sync with the server. The per-cell dict is the canonical working store;
-        # the annotation list is derived from it via label_runs_from_cells().
-        self._labels: list[tuple[int, int, str, Color]] = []
-        self._label_cells: dict[tuple[int, int], tuple[str, Color]] = {}
+        # Stored terminal-text labels: a list of ``LabelObject`` (id, per-line
+        # start position, text, colour) in terminal-cell coordinates (NOT canvas
+        # pixels), kept in sync with the server. One text-entry session becomes
+        # exactly one object. ``_selected_label_id`` is the select tool's single
+        # selection (only one label selected at a time).
+        self._labels: list[LabelObject] = []
+        self._label_next_id = 1
+        self._selected_label_id: int | None = None
         # In-progress label entry (terminal cells, not pixels). The session's
         # typed cells render on top of the stored labels and only become
-        # permanent (merged + synced to the server) when the session is
-        # finalized. Backspace on an empty session may remove an existing
-        # finalized label cell; its pre-removal value is kept in
-        # ``_label_removed`` so Escape restores it.
+        # permanent (a brand-new object, or an in-place edit of the object being
+        # edited) when the session is finalized. ``_label_color`` is fixed at
+        # the session start, so a label object always has a single colour.
         self._label_active = False
         self._label_row = 0
         self._label_col = 0
         self._label_line_start_col = 0
+        self._label_color: Color = self._color
         self._label_history: list[dict[str, Any]] = []
         self._label_session_cells: dict[tuple[int, int], tuple[str, Color]] = {}
-        self._label_removed: dict[tuple[int, int], tuple[str, Color]] = {}
-        # The current on-screen overlay (stored + session), diffed against
-        # ``_old_label_chars`` so label edits rewrite only affected cells.
+        # In-place editing of an existing label (the select tool's Enter):
+        # ``_label_edit_oid`` is the object being edited and
+        # ``_label_edit_original`` is a copy of its pre-edit content so Escape
+        # reverts to it. Both are None for a fresh label session.
+        self._label_edit_oid: int | None = None
+        self._label_edit_original: LabelObject | None = None
+        # Select-tool drag state for moving a label: which object is being
+        # dragged, where the press landed relative to its hitbox's top-left,
+        # and the dimmed preview object (uncommitted until release).
+        self._label_drag_id: int | None = None
+        self._label_drag_offset: tuple[int, int] | None = None
+        self._label_drag_preview: LabelObject | None = None
+        # The current on-screen overlay (stored labels + session + drag preview
+        # + selection border), diffed against ``_old_label_chars`` so label
+        # edits rewrite only the affected terminal columns.
         self._label_chars: dict[tuple[int, int], tuple[str, Color]] = {}
         self._old_label_chars: dict[tuple[int, int], tuple[str, Color]] = {}
+        # The last wire representation we synced (or received), so redundant
+        # ``_sync_labels`` calls don't re-broadcast an unchanged label list.
+        self._last_label_wire: list[dict[str, Any]] | None = None
 
         self._sock: socket.socket | None = None
         self._quit = threading.Event()
@@ -1416,8 +1477,8 @@ class CanvasApp:
         own font — crisp at any size. ``reverse`` (the cursor) swaps fg/bg so a
         label char under the cursor blinks like the block around it.
         """
-        if trow >= len(rows):
-            return  # below the visible canvas area
+        if trow < 0 or trow >= len(rows):
+            return  # outside the visible canvas area
         layout = self._layout()
         term_row = layout["top_pad"] + 3 + trow
         for tcol in sorted(tcols):
@@ -1429,7 +1490,7 @@ class CanvasApp:
             if term_row > layout["term_h"] or term_col > layout["term_w"]:
                 continue  # off-screen: skip (the pixel cell was already written)
             cell_x = tcol // CELL_W
-            if cell_x < len(rows[trow]):
+            if 0 <= cell_x < len(rows[trow]):
                 br, bg, bb = rows[trow][cell_x][1]  # the cell's bottom pixel
             else:
                 br, bg, bb = self._background
@@ -1453,12 +1514,13 @@ class CanvasApp:
         cell's two columns.
         """
         cell_xs = {tcol // CELL_W for tcol in tcols}
-        if trow < len(rows):
+        if 0 <= trow < len(rows):
             for cell_x in cell_xs:
-                if cell_x < len(rows[trow]):
+                if 0 <= cell_x < len(rows[trow]):
                     self._write_cell(file, trow, cell_x, rows[trow][cell_x])
         overlay_cols = {
-            c for cell_x in cell_xs for c in (cell_x * CELL_W, cell_x * CELL_W + 1)
+            c for cell_x in cell_xs if 0 <= cell_x
+            for c in (cell_x * CELL_W, cell_x * CELL_W + 1)
         }
         self._overlay_labels(file, rows, trow, overlay_cols)
 
@@ -1603,10 +1665,17 @@ class CanvasApp:
     def _set_tool(self, tool: str) -> list[dict[str, Any]]:
         # Switching tools commits any in-progress text entry and any in-progress
         # label entry (finalize is visual-no-change, so a chrome redraw is safe).
+        # Leaving the select tool drops the selection — and its border needs a
+        # full canvas redraw to erase, so fall back to ``_draw()`` there.
         self._text_finalize()
         self._label_finalize()
         self._tool = tool
-        self._pending_chrome = True
+        if tool != TOOL_SELECT:
+            cleared = self._selected_label_id is not None
+            self._selected_label_id = None
+            self._pending_chrome = not cleared
+        else:
+            self._pending_chrome = True
         return []
 
     def _tool_eraser(self) -> list[dict[str, Any]]:
@@ -1615,7 +1684,11 @@ class CanvasApp:
         self._text_finalize()
         self._label_finalize()
         self._tool = TOOL_ERASER if self._tool != TOOL_ERASER else TOOL_PAINT
-        self._pending_chrome = True
+        if self._selected_label_id is not None:
+            self._selected_label_id = None
+            self._pending_chrome = False  # full redraw clears the border
+        else:
+            self._pending_chrome = True
         return []
 
     def _tool_filled_rect(self) -> list[dict[str, Any]]:
@@ -1853,7 +1926,7 @@ class CanvasApp:
         self._cursor_x = min(self._text_x, max(0, self._width - 1))
         self._cursor_y = min(self._text_y, max(0, self._height - 1))
 
-    # -- label tool state machine -------------------------------------------
+    # -- label tool / select tool state machine -----------------------------
     #
     # The label tool is the literal-text counterpart to the pixel-art text tool.
     # Selecting it and clicking the canvas starts a label session at that
@@ -1862,25 +1935,39 @@ class CanvasApp:
     # the pixel grid in the terminal's own font; backspace removes the last
     # character, Enter starts a new line below, and Escape cancels the whole
     # in-progress label. Clicking elsewhere or switching tools finalizes it —
-    # the session cells merge into the stored ``_label_cells`` and are synced to
-    # the server as (row, col, text, color) annotations, which see_canvas shows.
+    # the session becomes ONE ``LabelObject`` (id, per-line positions, text,
+    # colour, hitbox) and is synced to the server, which see_canvas shows.
     # Labels never touch the pixel grid: they are an overlay.
+    #
+    # The select tool turns those objects into manipulable things: clicking
+    # inside a label's hitbox selects it (a cyan box-drawing border wraps the
+    # hitbox), clicking empty space deselects, dragging moves it (a dimmed
+    # preview follows the cursor; release commits the new position), Delete or
+    # Backspace removes the object entirely, and Enter re-opens it for in-place
+    # editing — cursor at the end of its text, backspace/typing modify it in
+    # place, and Escape reverts to the pre-edit content (it does not delete, as
+    # it does for a fresh label session, which has nothing to revert to). Only
+    # one label is ever selected, and selection never touches the pixel canvas.
 
     def _label_place(self, row: int, col: int) -> list[dict[str, Any]]:
-        """Start a label session at terminal cell (row, col); finalize any prior
-        text/label session. Returns [] without setting ``_pending_chrome`` —
-        label typing produces overlay-only changes, so ``_after_edit`` must do a
-        full ``_draw()``, not just a chrome redraw."""
+        """Start a fresh label session at terminal cell (row, col); finalize any
+        prior text/label session and drop any selection. Returns [] without
+        setting ``_pending_chrome`` — label typing produces overlay-only changes,
+        so ``_after_edit`` must do a full ``_draw()``, not just a chrome redraw."""
         self._text_finalize()
         self._label_finalize()
+        self._selected_label_id = None
         self._label_active = True
         self._label_row = row
         self._label_col = col
         self._label_line_start_col = col
+        self._label_color = self._color
         self._label_history = []
         self._label_session_cells = {}
-        self._label_removed = {}
+        self._label_edit_oid = None
+        self._label_edit_original = None
         self._sync_label_caret()
+        self._pending_chrome = False
         return []
 
     def _label_type_char(self, ch: str) -> list[dict[str, Any]]:
@@ -1901,10 +1988,10 @@ class CanvasApp:
         if self._label_col >= self._width * CELL_W:
             return []  # right edge: stop accepting characters
         pos = (self._label_row, self._label_col)
-        self._label_session_cells[pos] = (ch, self._color)
+        self._label_session_cells[pos] = (ch, self._label_color)
         self._label_history.append(
             {"kind": "char", "row": self._label_row, "col": self._label_col,
-             "char": ch, "color": self._color}
+             "char": ch}
         )
         self._label_col += 1
         self._sync_label_caret()
@@ -1924,61 +2011,118 @@ class CanvasApp:
         return []
 
     def _label_backspace(self) -> list[dict[str, Any]]:
-        """Erase the last character (or undo a newline) and step back. With an
-        empty session, removes an existing finalized label cell left of (or
-        under) the cursor so backspace can delete finished text too. The
-        removal stays local (in ``_label_removed``) until the session ends, so
-        Escape can restore it and no server echo cancels the session mid-entry."""
-        if not self._label_history:
-            self._erase_existing_label_cell()
+        """Erase the last character (or undo a newline) and step back.
+
+        Characters typed and newlines pressed during this session are undone
+        from ``_label_history``. Once the history is empty (editing a
+        pre-existing label), backspace removes the character before the caret
+        from the session, and at the start of a non-first line joins it back to
+        the line above. The first character of the whole label has nothing to
+        remove: backspace is a no-op there. (The select tool's Delete removes
+        whole labels instead — the label tool only ever edits the in-progress
+        session.)
+        """
+        if self._label_history:
+            entry = self._label_history.pop()
+            if entry["kind"] == "newline":
+                self._label_row, self._label_col = entry["row"], entry["col"]
+            else:
+                self._label_session_cells.pop(
+                    (entry["row"], entry["col"]), None
+                )
+                self._label_row, self._label_col = entry["row"], entry["col"]
+            self._sync_label_caret()
             return []
-        entry = self._label_history.pop()
-        if entry["kind"] == "newline":
-            self._label_row, self._label_col = entry["row"], entry["col"]
-        else:
-            self._label_session_cells.pop(
-                (entry["row"], entry["col"]), None
-            )
-            self._label_row, self._label_col = entry["row"], entry["col"]
-        self._sync_label_caret()
+        pos = (self._label_row, self._label_col - 1)
+        if pos in self._label_session_cells:
+            del self._label_session_cells[pos]
+            self._label_col -= 1
+            self._sync_label_caret()
+            return []
+        if self._label_row > 0:
+            # Caret at the start of a line: merge it back into the line above.
+            for (r, c) in list(self._label_session_cells):
+                if r == self._label_row:
+                    del self._label_session_cells[(r, c)]
+            self._label_row -= 1
+            cols = [c for (r, c) in self._label_session_cells
+                    if r == self._label_row]
+            self._label_col = max(cols) + 1 if cols else self._label_line_start_col
+            self._label_line_start_col = min(cols) if cols else self._label_line_start_col
+            self._sync_label_caret()
         return []
 
-    def _erase_existing_label_cell(self) -> bool:
-        """Pop one finalized label cell left of (or under) the cursor, keeping
-        it in ``_label_removed`` so Escape restores it. Returns True if removed."""
-        candidates = [(self._label_row, self._label_col - 1),
-                      (self._label_row, self._label_col)]
-        for candidate in candidates:
-            if candidate in self._label_cells:
-                self._label_removed[candidate] = self._label_cells.pop(candidate)
-                return True
-        return False
-
     def _label_cancel(self) -> list[dict[str, Any]]:
-        """Escape: discard the in-progress session. Any finalized cell removed
-        by backspace is restored first, so the stored labels are unchanged."""
+        """Escape: discard the in-progress session. For an in-place edit of an
+        existing label the object is restored to its pre-edit content (Escape
+        reverts — it does not delete); a fresh label session is simply dropped."""
         if not self._label_active:
             return []
-        if self._label_removed:
-            self._label_cells.update(self._label_removed)
+        if (self._label_edit_oid is not None
+                and self._label_edit_original is not None):
+            self._replace_label(self._label_edit_original)
         self._label_active = False
         self._label_session_cells = {}
-        self._label_removed = {}
         self._label_history = []
+        self._label_edit_oid = None
+        self._label_edit_original = None
         self._sync_labels()
         self._pending_chrome = False  # force _after_edit to redraw the canvas
         return []
 
     def _label_finalize(self) -> None:
-        """Commit any in-progress label: session cells merge into the stored
-        store and are synced to the server. Visual-no-change, so no redraw."""
-        if self._label_active and self._label_session_cells:
-            self._label_cells.update(self._label_session_cells)
+        """Commit any in-progress label session.
+
+        A fresh session becomes a brand-new ``LabelObject``; an in-place edit
+        replaces the object with the same id (an edit that deleted every
+        character removes the label). Visual-no-change, so no redraw.
+        """
+        if self._label_active:
+            if self._label_edit_oid is not None:
+                if self._label_session_cells:
+                    self._replace_label(self._object_from_cells(
+                        self._label_edit_oid, self._label_session_cells,
+                        self._label_color,
+                    ))
+                else:
+                    # The edit removed every character: delete the object.
+                    self._labels = [o for o in self._labels
+                                    if o.label_id != self._label_edit_oid]
+                    self._selected_label_id = None
+            elif self._label_session_cells:
+                obj = self._object_from_cells(
+                    self._label_next_id, self._label_session_cells,
+                    self._label_color,
+                )
+                self._labels.append(obj)
+                self._label_next_id += 1
         self._label_active = False
         self._label_session_cells = {}
-        self._label_removed = {}
         self._label_history = []
+        self._label_edit_oid = None
+        self._label_edit_original = None
         self._sync_labels()
+
+    def _object_from_cells(
+        self, oid: int, cells: dict[tuple[int, int], tuple[str, Color]],
+        color: Color,
+    ) -> LabelObject:
+        """Group session cells back into a LabelObject. Each row of cells
+        becomes one line (cells are always contiguous per row while typing)."""
+        lines: list[tuple[int, int, str]] = []
+        for row in sorted({r for r, _c in cells}):
+            cols = sorted(c for r, c in cells if r == row)
+            text = "".join(cells[(row, c)][0] for c in cols)
+            lines.append((row, cols[0], text))
+        return LabelObject(oid, lines, color)
+
+    def _replace_label(self, obj: LabelObject) -> None:
+        """Swap the stored object with ``obj.label_id`` for ``obj``."""
+        for i, existing in enumerate(self._labels):
+            if existing.label_id == obj.label_id:
+                self._labels[i] = obj
+                return
+        self._labels.append(obj)  # unknown id (shouldn't happen): just add it
 
     def _sync_label_caret(self) -> None:
         """Move the canvas cursor to the label insertion point (clamped to the
@@ -1986,30 +2130,203 @@ class CanvasApp:
         self._cursor_x = min(self._label_col // CELL_W, max(0, self._width - 1))
         self._cursor_y = min(self._label_row * 2, max(0, self._height - 1))
 
+    # -- select tool: selection, move, delete, edit --------------------------
+
+    def _tool_select(self) -> list[dict[str, Any]]:
+        return self._set_tool(TOOL_SELECT)
+
+    def _selected_label(self) -> LabelObject | None:
+        """The currently selected label object, or None."""
+        for obj in self._labels:
+            if obj.label_id == self._selected_label_id:
+                return obj
+        return None
+
+    def _label_at(self, row: int, col: int) -> LabelObject | None:
+        """The topmost label whose hitbox contains terminal cell (row, col), or
+        None. Later labels are drawn on top, so they win on overlap."""
+        for obj in reversed(self._labels):
+            hitbox = label_hitbox(obj)
+            if hitbox is None:
+                continue
+            r0, c0, r1, c1 = hitbox
+            if r0 <= row <= r1 and c0 <= col <= c1:
+                return obj
+        return None
+
+    def _selection_hitbox(self) -> tuple[int, int, int, int] | None:
+        """The hitbox the selection border should wrap right now: the dragged
+        label's preview while dragging, the edited label's current content while
+        editing, otherwise the stored object's hitbox."""
+        if self._label_drag_preview is not None:
+            return label_hitbox(self._label_drag_preview)
+        if self._label_edit_oid is not None:
+            return hitbox_from_cells(self._label_session_cells)
+        obj = self._selected_label()
+        if obj is None:
+            return None
+        return label_hitbox(obj)
+
+    def _deselect_label(self) -> None:
+        """Clear the select tool's selection (and any in-progress drag)."""
+        self._selected_label_id = None
+        self._label_drag_id = None
+        self._label_drag_offset = None
+        self._label_drag_preview = None
+
+    def _handle_label_select_press(
+        self, button: int, trow: int, tcol: int,
+    ) -> list[dict[str, Any]]:
+        """A press inside the canvas display area with the select tool active:
+        click a label to select it (switching from any previous selection) and
+        arm a drag from that press; click empty space to deselect. A simple
+        click with no motion just selects."""
+        if button != 0:
+            return []
+        self._text_finalize()
+        self._label_finalize()
+        label = self._label_at(trow, tcol)
+        if label is None:
+            self._deselect_label()
+            self._pending_chrome = False
+            return []  # empty canvas area: deselect
+        self._selected_label_id = label.label_id
+        hitbox = label_hitbox(label)
+        self._label_drag_id = label.label_id
+        self._label_drag_offset = (trow - hitbox[0], tcol - hitbox[1])
+        self._pending_chrome = False
+        return []
+
+    def _update_label_drag(self, row: int, col: int) -> list[dict[str, Any]]:
+        """Motion during a label drag: move the dimmed preview to follow the
+        cursor, clamped so the whole label stays on the canvas."""
+        obj = self._selected_label()
+        if obj is None or self._label_drag_offset is None:
+            return []
+        hitbox = label_hitbox(obj)
+        if hitbox is None:
+            return []
+        dr = (row - self._label_drag_offset[0]) - hitbox[0]
+        dc = (col - self._label_drag_offset[1]) - hitbox[1]
+        layout = self._compute_layout()
+        dr = min(max(dr, -hitbox[0]), (layout["canvas_rows"] - 1) - hitbox[2])
+        dc = min(max(dc, -hitbox[1]), (self._width * CELL_W - 1) - hitbox[3])
+        lines = [(r + dr, c + dc, text) for (r, c, text) in obj.lines]
+        self._label_drag_preview = LabelObject(obj.label_id, lines, obj.color)
+        self._pending_chrome = False
+        return []
+
+    def _commit_label_drag(self) -> list[dict[str, Any]]:
+        """Release: commit any in-progress label drag at the preview position."""
+        if self._label_drag_id is None:
+            return []
+        self._label_drag_id = None
+        self._label_drag_offset = None
+        preview = self._label_drag_preview
+        self._label_drag_preview = None
+        if preview is not None:
+            self._replace_label(preview)
+            self._sync_labels()
+        self._pending_chrome = False
+        return []
+
+    def _delete_selected_label(self) -> list[dict[str, Any]]:
+        """Delete/Backspace with the select tool active: remove the selected
+        label object entirely (and sync the removal)."""
+        if self._selected_label_id is None:
+            return []
+        self._labels = [o for o in self._labels
+                        if o.label_id != self._selected_label_id]
+        self._selected_label_id = None
+        self._sync_labels()
+        self._pending_chrome = False
+        return []
+
+    def _edit_selected_label(self) -> list[dict[str, Any]]:
+        """Enter with the select tool active: re-open the selected label for
+        in-place editing, cursor at the end of its last line. Backspace/typing
+        modify it in place; Escape reverts to the pre-edit content; finalizing
+        (click elsewhere or switch tools) commits the edit."""
+        obj = self._selected_label()
+        if obj is None:
+            return []
+        self._text_finalize()
+        self._label_finalize()
+        self._label_edit_oid = obj.label_id
+        self._label_edit_original = LabelObject(
+            obj.label_id, list(obj.lines), obj.color,
+        )
+        self._label_active = True
+        self._label_color = obj.color
+        self._label_session_cells = {
+            (row, col): (char, obj.color)
+            for (row, col), (char, _color) in label_cells(obj).items()
+        }
+        last_row, last_col, last_text = obj.lines[-1]
+        self._label_row = last_row
+        self._label_col = last_col + len(last_text)
+        self._label_line_start_col = last_col
+        self._label_history = []
+        self._sync_label_caret()
+        self._pending_chrome = False
+        return []
+
     def _build_label_chars(self) -> dict[tuple[int, int], tuple[str, Color]]:
-        """The current overlay: stored labels plus any in-progress session."""
-        out = dict(self._label_cells)
-        out.update(self._label_session_cells)
+        """The current overlay: stored labels, any in-progress session, the
+        dimmed drag preview, and the selected label's border ring.
+
+        The stored loop skips the label being edited (it renders via the
+        session cells) and the one being dragged (it renders via the dimmed
+        preview), so their previous cells never linger as stale overlay pixels.
+        """
+        out: dict[tuple[int, int], tuple[str, Color]] = {}
+        for obj in self._labels:
+            if (self._label_drag_preview is not None
+                    and obj.label_id == self._label_drag_preview.label_id):
+                continue
+            if (self._label_edit_oid is not None
+                    and obj.label_id == self._label_edit_oid):
+                continue
+            for (row, col), (char, _color) in label_cells(obj).items():
+                out[(row, col)] = (char, obj.color)
+        for (row, col), (char, _color) in self._label_session_cells.items():
+            out[(row, col)] = (char, self._label_color)
+        if self._label_drag_preview is not None:
+            dimmed = tuple(int(c * PREVIEW_DIM)
+                           for c in self._label_drag_preview.color)
+            for (row, col), (char, _color) in label_cells(
+                self._label_drag_preview,
+            ).items():
+                out[(row, col)] = (char, dimmed)
+        hitbox = self._selection_hitbox()
+        if hitbox is not None:
+            for (row, col), char in label_border_cells(hitbox).items():
+                out[(row, col)] = (char, SELECTION_COLOR)
         return out
 
+    def _label_wire(self) -> list[dict[str, Any]]:
+        """The label objects as the wire/see_canvas representation."""
+        return [
+            {"id": obj.label_id,
+             "lines": [list(line) for line in obj.lines],
+             "color": list(obj.color)}
+            for obj in self._labels
+        ]
+
     def _sync_labels(self) -> None:
-        """Re-derive the annotation list from the cell store and push it to the
-        server if it changed."""
-        new_labels = label_runs_from_cells(self._label_cells)
-        if new_labels != self._labels:
-            self._labels = new_labels
+        """Push the stored objects to the server whenever they changed."""
+        wire = self._label_wire()
+        if wire != self._last_label_wire:
+            self._last_label_wire = wire
             self._send_labels()
 
     def _send_labels(self) -> None:
-        """Broadcast the full annotation list to the server."""
+        """Broadcast the full label-object list to the server."""
         if self._sock is None:
             return
         payload = json.dumps({
             "type": "labels",
-            "labels": [
-                [row, col, text, list(color)]
-                for row, col, text, color in self._labels
-            ],
+            "labels": self._last_label_wire or self._label_wire(),
         }) + "\n"
         try:
             self._sock.sendall(payload.encode())
@@ -2017,30 +2334,49 @@ class CanvasApp:
             pass
 
     def _apply_labels(self, labels: list[Any]) -> None:
-        """Replace stored annotations from a server ``labels`` message. Any
+        """Replace stored labels from a server ``labels`` message. Any
         in-progress label session is cancelled (its cells were not synced)."""
         self._label_active = False
         self._label_session_cells = {}
-        self._label_removed = {}
         self._label_history = []
-        cells: dict[tuple[int, int], tuple[str, Color]] = {}
+        self._label_edit_oid = None
+        self._label_edit_original = None
+        self._label_drag_id = None
+        self._label_drag_offset = None
+        self._label_drag_preview = None
+        objects: list[LabelObject] = []
         for entry in labels:
-            if not (isinstance(entry, list) and len(entry) == 4):
+            if not (isinstance(entry, dict)
+                    and "id" in entry and "lines" in entry and "color" in entry):
                 continue
-            row, col, text, color = entry
-            if not (isinstance(row, int) and isinstance(col, int)
-                    and isinstance(text, str)):
+            oid = entry["id"]
+            if not isinstance(oid, int):
                 continue
             try:
-                rgb = tuple(int(c) for c in color)
+                rgb = tuple(int(c) for c in entry["color"])
             except (TypeError, ValueError):
                 continue
             if len(rgb) != 3:
                 continue
-            for i, char in enumerate(text):
-                cells[(row, col + i)] = (char, Color(rgb))
-        self._label_cells = cells
-        self._labels = label_runs_from_cells(cells)
+            lines: list[tuple[int, int, str]] = []
+            for line in entry["lines"]:
+                if not (isinstance(line, list) and len(line) == 3):
+                    continue
+                row, col, text = line
+                if not (isinstance(row, int) and isinstance(col, int)
+                        and isinstance(text, str)):
+                    continue
+                lines.append((row, col, text))
+            objects.append(LabelObject(oid, lines, Color(rgb)))
+        self._labels = objects
+        if objects:
+            self._label_next_id = max(self._label_next_id,
+                                      max(o.label_id for o in objects) + 1)
+        if (self._selected_label_id is not None and not any(
+            o.label_id == self._selected_label_id for o in objects
+        )):
+            self._selected_label_id = None
+        self._last_label_wire = self._label_wire()
 
     def _tool_brush_dec(self) -> list[dict[str, Any]]:
         return self._set_size(self._current_size() - 1)
@@ -2107,17 +2443,34 @@ class CanvasApp:
         click; the text tool places (or moves) its insertion point. With a shape
         tool active, press starts a drag, motion moves the preview's end point,
         and release commits the shape as a normal edit; a release with no drag
-        in progress is a no-op. Toolbar and swatch clicks act like the matching
-        keyboard shortcut (and leave palette mode, mirroring keyboard
-        behaviour). Any click also cancels an in-progress custom-colour hex
-        input, and every non-text press finalizes any in-progress text entry.
+        in progress is a no-op. With the select tool active, a click on a label
+        selects it (and starts a move-drag), a click on empty canvas deselects,
+        and motion/release drive the move's dimmed preview and commit. Toolbar
+        and swatch clicks act like the matching keyboard shortcut (and leave
+        palette mode, mirroring keyboard behaviour). Any click also cancels an
+        in-progress custom-colour hex input, and every non-text press finalizes
+        any in-progress text entry.
         """
         if not pressed:
+            if self._tool == TOOL_SELECT:
+                return self._commit_label_drag()  # release: commit the move
             return self._commit_shape()  # release: commit any in-progress shape
         if self._custom_color_mode:
             self._exit_custom_color()
         if button not in (0, 4, 32, 36):
             return []  # middle/right button, or a stray event
+        # With the select tool, every press inside the canvas display area is a
+        # selection action (select / deselect / start a move-drag); motion keeps
+        # a move-drag's preview moving. Presses on the chrome rows fall through
+        # to the normal toolbar / palette / quick-colour hit-testing below.
+        if self._tool == TOOL_SELECT:
+            label_hit = self._label_cell(col, row)
+            if button in (32, 36):  # mouse motion during a drag
+                if self._label_drag_id is not None and label_hit is not None:
+                    return self._update_label_drag(*label_hit)
+                return []
+            if label_hit is not None:
+                return self._handle_label_select_press(button, *label_hit)
         # A canvas click with the text tool places the insertion point. That is
         # the one press that does not finalize text here (any old session is
         # finalized-and-restarted inside _text_place).
@@ -2258,6 +2611,14 @@ class CanvasApp:
             # An active label swallows every key (including +/-) as a literal
             # character — the label renders real terminal text, not brush art.
             return self._label_type_char(ch)
+        if self._tool == TOOL_SELECT:
+            # Delete/Backspace removes the selected label object; Enter re-opens
+            # it for in-place editing. Every other key falls through to normal
+            # handling, so tool switches, painting and quit keep working.
+            if ch in ("\x7f", "\x08") and self._selected_label_id is not None:
+                return self._delete_selected_label()
+            if ch in ("\r", "\n") and self._selected_label_id is not None:
+                return self._edit_selected_label()
         if ch == "q":
             self._quit.set()
             return []
@@ -2279,9 +2640,7 @@ class CanvasApp:
         if ch == "x":
             return self._erase()
         if ch == "e":
-            self._tool = TOOL_ERASER if self._tool != TOOL_ERASER else TOOL_PAINT
-            self._pending_chrome = True
-            return []
+            return self._tool_eraser()
         if ch == "p":
             return self._set_tool(TOOL_PAINT)
         if ch == "r":
@@ -2300,6 +2659,8 @@ class CanvasApp:
             return self._set_tool(TOOL_TEXT)
         if ch == "a":
             return self._set_tool(TOOL_LABEL)
+        if ch == "v":
+            return self._set_tool(TOOL_SELECT)
         if ch in "+=":
             return self._set_size(self._current_size() + 1)
         if ch in "-_":
